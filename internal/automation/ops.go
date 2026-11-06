@@ -176,6 +176,7 @@ func screenCall(act func(ctx context.Context, phone *device.Phone, call *operati
 		if err != nil {
 			return nil, err
 		}
+		defer call.engine.host.acting()()
 		return act(ctx, phone, call)
 	}
 }

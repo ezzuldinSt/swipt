@@ -26,6 +26,8 @@ import (
 type Graphics struct {
 	options Options
 	feed    *feed.Feed
+	// shots keeps the newest screenshot while the feed proves it exact.
+	shots   *shotCache
 	access  sync.Mutex
 	engines map[uint64]*engine
 }
@@ -133,6 +135,9 @@ func New(options Options) *Graphics {
 			options.Logger.Info("reading the screen with screenshots: ", err)
 		} else {
 			g.feed = feed.New(options.Connection, options.Logger)
+			phone := options.Connection.Phone()
+			g.shots = newShotCache(phone.Capture, phone.LastInput)
+			g.feed.AddFrameListener(func(frame *feed.Frame) { g.shots.frame(feedShotFrame{frame: frame}) })
 		}
 	}
 	return g
@@ -144,6 +149,15 @@ func (g *Graphics) Prewarm() {
 	if g.feed != nil {
 		g.feed.Prewarm()
 	}
+}
+
+// Acting tells the graphics that a script's action on the device starts, and answers what
+// tells them it ended: the cached screenshot may be stale after it.
+func (g *Graphics) Acting() func() {
+	if g.shots == nil {
+		return func() {}
+	}
+	return g.shots.act()
 }
 
 // lease takes the live feed for a screen call, or nothing to read the screen
@@ -242,7 +256,7 @@ func (g *Graphics) Run(id uint64, callID int64, call *automation.GraphicsCall) (
 }
 
 func (g *Graphics) execute(ctx context.Context, e *engine, it *prepared, call *automation.GraphicsCall) (any, error) {
-	env := environment{engine: e, call: call}
+	env := environment{engine: e, call: call, shots: g.shots}
 	if strings.HasPrefix(it.method, "screen.") {
 		if env.lease = g.lease(ctx); env.lease != nil {
 			defer env.lease.Release()
@@ -603,6 +617,7 @@ type environment struct {
 	engine *engine
 	call   *automation.GraphicsCall
 	lease  *feed.Lease
+	shots  *shotCache
 }
 
 // Feed makes raster.Run read the screen calls from the live feed.
@@ -621,8 +636,12 @@ func (v environment) Authorize(path string, write bool) error {
 	return v.call.Authorize(path, write)
 }
 
-func (v environment) Screenshot(context.Context) ([]byte, float64, error) {
-	return v.call.Screenshot()
+// Screenshot takes the screenshot call's PNG, from the cache when the live feed proves it exact.
+func (v environment) Screenshot(ctx context.Context) ([]byte, float64, error) {
+	if v.shots == nil {
+		return v.call.Screenshot()
+	}
+	return v.shots.screenshot(ctx, func(context.Context) ([]byte, float64, error) { return v.call.Screenshot() })
 }
 
 // LastInput makes screen waits right after input give the screen time to answer it.
