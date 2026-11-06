@@ -16,6 +16,7 @@ import (
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/swipt-automation/swipt/internal/jsc"
+	"github.com/swipt-automation/swipt/internal/log"
 )
 
 type Graphics interface {
@@ -67,6 +68,27 @@ func (c *GraphicsCall) Screenshot() ([]byte, float64, error) {
 		err = c.call.droppedError(err, "during the screenshot")
 	}
 	return data, scale, err
+}
+
+// The device answers its language within this, or text recognition goes on without it.
+const languageLimit = 2 * time.Second
+
+// Language is the language of the device, which text recognition reads in by default, or "" when
+// there is no device or it does not answer.
+func (c *GraphicsCall) Language() string {
+	phone := c.call.engine.host.options.Device
+	if phone == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(c.ctx, languageLimit)
+	defer cancel()
+	language, _ := phone.Language(ctx)
+	return language
+}
+
+// Warn tells the script, in its console and log, something it should know about the call.
+func (c *GraphicsCall) Warn(message string) {
+	c.call.engine.logTo(c.call.exec, log.LevelWarn, message)
 }
 
 func (c *GraphicsCall) Tracing() bool {

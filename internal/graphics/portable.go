@@ -39,6 +39,7 @@ type engine struct {
 	prepared   map[int64]*prepared
 	objects    map[int64]any
 	recordings map[*recordingSession]struct{}
+	notes      map[string]bool
 	closed     bool
 }
 
@@ -255,7 +256,7 @@ func (g *Graphics) execute(ctx context.Context, e *engine, it *prepared, call *a
 		if err != nil {
 			return nil, err
 		}
-		text, err := recognize.ReadText(ctx, source, options)
+		text, err := env.readText(ctx, source, options)
 		if err != nil {
 			return nil, err
 		}
@@ -537,6 +538,20 @@ func (e *engine) keep(object any) int64 {
 	return identifier
 }
 
+// firstNote tells whether the engine has not had the note before.
+func (e *engine) firstNote(note string) bool {
+	e.access.Lock()
+	defer e.access.Unlock()
+	if e.notes[note] {
+		return false
+	}
+	if e.notes == nil {
+		e.notes = make(map[string]bool)
+	}
+	e.notes[note] = true
+	return true
+}
+
 // addRecording remembers a recording, to stop it if it is still going when the engine closes.
 func (e *engine) addRecording(session *recordingSession) {
 	e.access.Lock()
@@ -620,11 +635,24 @@ func (v environment) RecognizeText(ctx context.Context, frame *raster.Image, arg
 	if err != nil {
 		return nil, err
 	}
-	text, err := recognize.ReadText(ctx, source, options)
+	text, err := v.readText(ctx, source, options)
 	if err != nil {
 		return nil, err
 	}
 	return recognized{text}, nil
+}
+
+// readText reads text in the languages asked for, or else in the device's, as Vision does on the
+// device, telling the script once a session when Windows has to read in another language.
+func (v environment) readText(ctx context.Context, source recognize.Image, options recognize.TextOptions) (*recognize.Text, error) {
+	if len(options.Languages) == 0 {
+		options.Device = v.call.Language()
+	}
+	text, err := recognize.ReadText(ctx, source, options)
+	if err == nil && text.Note != "" && v.engine.firstNote(text.Note) {
+		v.call.Warn("graphics: " + text.Note)
+	}
+	return text, err
 }
 
 type recognized struct {

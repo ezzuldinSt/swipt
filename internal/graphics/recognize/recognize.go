@@ -92,6 +92,10 @@ type TextOptions struct {
 	Region        *[4]float64 `json:"region,omitempty"`
 	Languages     []string    `json:"languages,omitempty"`
 	MinimumHeight float64     `json:"minimumHeight,omitempty"`
+	// Device is the language of the device the image comes from, which a call without Languages
+	// reads in, as Vision reads in the device's languages; when Windows has no recognizer for it, the
+	// call reads in the user's profile languages and Text.Note says so.
+	Device string `json:"-"`
 }
 
 // Candidate is one reading of a line.
@@ -111,6 +115,9 @@ type Line struct {
 // text handle.
 type Text struct {
 	Lines []Line `json:"lines"`
+	// Note tells which language the recognition fell back to, and why, when it could not read in the
+	// device's.
+	Note  string `json:"-"`
 	words [][]word
 	// place maps the recognizer's space, where words are upright rects, to points.
 	place func(x, y float64) [2]float64
