@@ -641,10 +641,13 @@ func (f *foreground) waitFor(ctx context.Context, bundleID string, pid uint64, d
 	from, acted := f.current, f.actedAt
 	f.access.Unlock()
 	f.trigger(time.Until(deadline))
+	started := time.Now()
 	switch {
 	case pid != 0:
+		f.conn.connection.trace(started, "wait.arrival", bundleID+" pid "+strconv.FormatUint(pid, 10), 0)
 		go f.followArrival(waiting, pid, bundleID)
 	case bundleID == springboardBundleID && from.app():
+		f.conn.connection.trace(started, "wait.leave", from.bundleID+" pid "+strconv.FormatUint(from.pid, 10), 0)
 		go f.followLeave(waiting, from)
 	}
 	// Seeing the same app again tells no listener, so the wait also looks
@@ -657,6 +660,7 @@ func (f *foreground) waitFor(ctx context.Context, bundleID string, pid uint64, d
 		f.access.Unlock()
 		if current.bundleID == bundleID && !current.at.Before(acted) {
 			f.settle()
+			f.conn.connection.trace(started, "wait.done", bundleID+" via "+current.via, time.Since(started))
 			return bundleID, nil
 		}
 		select {
