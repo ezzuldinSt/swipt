@@ -20,21 +20,24 @@ const macEpoch = 2082844800
 // The header of the mdat box: size 1, then the 64-bit size, so it may pass 4 GB.
 const mdatHeaderSize = 16
 
-// Writer writes one HEVC track of a QuickTime movie as samples come, like AVAssetWriter with
-// an input that passes them through (SWSegmentWriter.m): an 'hvc1' sample description with the
-// parameter sets, length-prefixed samples in the mdat box, and the moov box at the end. Its
-// track matrix turns the pictures clockwise by quarter turns, as the writer input's transform.
+// Writer writes one video track of a QuickTime movie as samples come, like AVAssetWriter with
+// an input that passes them through (SWSegmentWriter.m): an 'hvc1' or 'avc1' sample
+// description with the parameter sets, length-prefixed samples in the mdat box, and the moov
+// box at the end. Its track matrix turns the pictures clockwise by quarter turns, as the
+// writer input's transform.
 type Writer struct {
-	file      *os.File
-	output    *bufio.Writer
-	format    *Format
-	turns     int
-	timescale uint32
-	created   uint32
+	file        *os.File
+	output      *bufio.Writer
+	format      *Format
+	description description
+	turns       int
+	timescale   uint32
+	created     uint32
 
 	written   int64
 	sizes     []uint32
 	durations []uint32
+	offsets   []int64
 	syncs     []uint32
 	duration  int64
 	failure   error
@@ -42,15 +45,50 @@ type Writer struct {
 	scratch   []byte
 }
 
-// Create starts a movie at path, replacing any file there.
+// description is a sample description: the sample entry and its configuration box.
+type description struct {
+	codec         Codec
+	entry, box    string
+	name          string
+	configuration []byte
+	width, height int
+}
+
+// Create starts an HEVC movie at path, replacing any file there.
 func Create(path string, format *Format, turns int, timescale uint32) (*Writer, error) {
+	return create(path, format, format.description(), turns, timescale)
+}
+
+// CreateTrack starts a movie at path for a track of codec with these parameter sets (the VPS,
+// SPS and PPS of HEVC, or the SPS and PPS of H.264) and pictures of width by height.
+func CreateTrack(path string, codec Codec, parameterSets [][]byte, width, height, turns int, timescale uint32) (*Writer, error) {
+	switch codec {
+	case HEVC:
+		format, found := HEVCFormat(parameterSets)
+		if !found {
+			return nil, E.New("the HEVC track has no usable VPS, SPS and PPS")
+		}
+		return Create(path, format, turns, timescale)
+	case H264:
+		configuration, err := avcConfiguration(parameterSets)
+		if err != nil {
+			return nil, err
+		}
+		return create(path, nil, description{
+			codec: H264, entry: "avc1", box: "avcC", name: "H.264", configuration: configuration, width: width, height: height,
+		}, turns, timescale)
+	}
+	return nil, E.New("a movie of ", codec)
+}
+
+func create(path string, format *Format, entry description, turns int, timescale uint32) (*Writer, error) {
 	file, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
 	w := &Writer{
-		file: file, output: bufio.NewWriterSize(file, 1<<20), format: format, turns: ((turns % 4) + 4) % 4, timescale: timescale,
-		created: uint32(time.Now().Unix() + macEpoch),
+		file: file, output: bufio.NewWriterSize(file, 1<<20), format: format, description: entry, turns: ((turns % 4) + 4) % 4,
+		timescale: timescale, created: uint32(time.Now().Unix() + macEpoch),
 	}
 	header := []byte{0, 0, 0, 20, 'f', 't', 'y', 'p', 'q', 't', ' ', ' ', 0, 0, 0, 0, 'q', 't', ' ', ' '}
 	header = append(header, 0, 0, 0, 1, 'm', 'd', 'a', 't', 0, 0, 0, 0, 0, 0, 0, mdatHeaderSize)
@@ -81,6 +119,12 @@ func (w *Writer) Samples() int {
 // keyframe. The parameter sets stay in the sample description, so a unit of nothing else
 // writes no sample and answers false (SWHEVC.m SWHEVCSample).
 func (w *Writer) Append(nals [][]byte, duration int64, sync bool) (bool, error) {
+	return w.AppendAt(nals, duration, 0, sync)
+}
+
+// AppendAt is Append for a unit presented offset ticks after it is decoded, as an encoder
+// that reorders frames gives them.
+func (w *Writer) AppendAt(nals [][]byte, duration, offset int64, sync bool) (bool, error) {
 	if w.failure != nil {
 		return false, w.failure
 	}
@@ -89,7 +133,7 @@ func (w *Writer) Append(nals [][]byte, duration int64, sync bool) (bool, error) 
 	}
 	size := 0
 	for _, nal := range nals {
-		if kind := nalType(nal); kind < nalVPS || kind > nalPPS {
+		if !w.parameterSet(nal) {
 			size += 4 + len(nal)
 		}
 	}
@@ -101,7 +145,7 @@ func (w *Writer) Append(nals [][]byte, duration int64, sync bool) (bool, error) 
 	}
 	w.scratch = w.scratch[:0]
 	for _, nal := range nals {
-		if kind := nalType(nal); kind < nalVPS || kind > nalPPS {
+		if !w.parameterSet(nal) {
 			w.scratch = binary.BigEndian.AppendUint32(w.scratch, uint32(len(nal)))
 			w.scratch = append(w.scratch, nal...)
 		}
@@ -113,6 +157,12 @@ func (w *Writer) Append(nals [][]byte, duration int64, sync bool) (bool, error) 
 	w.written += int64(size)
 	w.sizes = append(w.sizes, uint32(size))
 	w.durations = append(w.durations, uint32(duration))
+	if offset != 0 && w.offsets == nil {
+		w.offsets = make([]int64, len(w.sizes)-1, cap(w.sizes))
+	}
+	if w.offsets != nil {
+		w.offsets = append(w.offsets, offset)
+	}
 	if sync {
 		w.syncs = append(w.syncs, uint32(len(w.sizes)))
 	}
@@ -219,7 +269,12 @@ func (b *builder) matrix(turns, width, height int) {
 func (w *Writer) movie() []byte {
 	b := &builder{}
 	movieDuration := uint32((w.duration*movieTimescale + int64(w.timescale)/2) / int64(w.timescale))
-	width, height := w.format.Width, w.format.Height
+	width, height := w.description.width, w.description.height
+	// Offsets below zero shift the media, and an edit starts the movie at its first picture.
+	shift := int64(0)
+	for _, offset := range w.offsets {
+		shift = max(shift, -offset)
+	}
 	b.open("moov")
 	b.full("mvhd", 0, 0)
 	b.u32(w.created)
@@ -250,6 +305,17 @@ func (w *Writer) movie() []byte {
 	b.u32(uint32(width) << 16)
 	b.u32(uint32(height) << 16)
 	b.close()
+
+	if shift > 0 {
+		b.open("edts")
+		b.full("elst", 0, 0)
+		b.u32(1)
+		b.u32(movieDuration)
+		b.u32(uint32(shift))
+		b.u32(0x00010000) // rate 1
+		b.close()
+		b.close()
+	}
 
 	b.open("mdia")
 	b.full("mdhd", 0, 0)
@@ -286,7 +352,7 @@ func (w *Writer) movie() []byte {
 	b.open("stbl")
 	b.full("stsd", 0, 0)
 	b.u32(1)
-	b.open("hvc1")
+	b.open(w.description.entry)
 	b.zeros(6)
 	b.u16(1)    // data reference index
 	b.zeros(16) // version, revision, vendor, temporal and spatial quality
@@ -297,13 +363,13 @@ func (w *Writer) movie() []byte {
 	b.u32(0)
 	b.u16(1) // frames a sample
 	name := make([]byte, 32)
-	name[0] = 4
-	copy(name[1:], "HEVC")
+	name[0] = byte(len(w.description.name))
+	copy(name[1:], w.description.name)
 	b.data = append(b.data, name...)
 	b.u16(24)
 	b.u16(0xffff)
-	b.open("hvcC")
-	b.data = append(b.data, w.format.configuration()...)
+	b.open(w.description.box)
+	b.data = append(b.data, w.description.configuration...)
 	b.close()
 	b.close()
 	b.close()
@@ -324,6 +390,25 @@ func (w *Writer) movie() []byte {
 	}
 	binary.BigEndian.PutUint32(b.data[countAt:], runs)
 	b.close()
+
+	if w.offsets != nil {
+		b.full("ctts", 0, 0)
+		countAt := len(b.data)
+		b.u32(0)
+		runs := uint32(0)
+		for index := 0; index < len(w.offsets); {
+			end := index
+			for end < len(w.offsets) && w.offsets[end] == w.offsets[index] {
+				end++
+			}
+			b.u32(uint32(end - index))
+			b.u32(uint32(w.offsets[index] + shift))
+			runs++
+			index = end
+		}
+		binary.BigEndian.PutUint32(b.data[countAt:], runs)
+		b.close()
+	}
 
 	if len(w.syncs) < len(w.sizes) {
 		b.full("stss", 0, 0)
@@ -368,4 +453,14 @@ func (w *Writer) movie() []byte {
 	b.close() // trak
 	b.close() // moov
 	return b.data
+}
+
+// parameterSet tells whether a NAL unit is a parameter set, which the sample description keeps.
+func (w *Writer) parameterSet(nal []byte) bool {
+	if w.description.codec == H264 {
+		kind := avcNALType(nal)
+		return kind == avcSPS || kind == avcPPS
+	}
+	kind := nalType(nal)
+	return kind >= nalVPS && kind <= nalPPS
 }

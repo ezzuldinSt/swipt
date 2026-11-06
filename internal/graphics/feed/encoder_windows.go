@@ -51,8 +51,7 @@ const (
 )
 
 // Encoder writes an MPEG-4 movie with Media Foundation's Sink Writer, which picks a hardware
-// encoder where there is one (SWVideoExport.m writes with AVAssetWriter). A .mov path gets the
-// same MPEG-4 container, which QuickTime reads.
+// encoder where there is one (SWVideoExport.m writes with AVAssetWriter).
 type Encoder struct {
 	worker *worker
 	writer *comObject

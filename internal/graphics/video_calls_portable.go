@@ -16,6 +16,7 @@ import (
 
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/swipt-automation/swipt/internal/graphics/feed"
+	"github.com/swipt-automation/swipt/internal/graphics/movie"
 	"github.com/swipt-automation/swipt/internal/graphics/raster"
 )
 
@@ -298,12 +299,20 @@ func exportGIF(ctx context.Context, target string, times []float64, step float64
 	return file.Close()
 }
 
-func exportMovie(ctx context.Context, target string, hevc bool, times []float64, from, rate float64, frame func(float64) (*image.NRGBA, error)) error {
+// exportMovie writes an MPEG-4 movie of H.264, or a QuickTime movie of HEVC for mov, as
+// SWVideoExport.m does. Media Foundation writes MPEG-4 only, so a QuickTime movie is encoded
+// into an MPEG-4 file beside it first and its samples copied over.
+func exportMovie(ctx context.Context, target string, mov bool, times []float64, from, rate float64, frame func(float64) (*image.NRGBA, error)) error {
 	first, err := frame(times[0])
 	if err != nil {
 		return err
 	}
-	encoder, err := feed.NewEncoder(feed.EncoderOptions{Path: target, HEVC: hevc, Width: first.Rect.Dx(), Height: first.Rect.Dy(), FrameRate: rate})
+	encoded := target
+	if mov {
+		encoded = target + ".mp4.part"
+		defer os.Remove(encoded)
+	}
+	encoder, err := feed.NewEncoder(feed.EncoderOptions{Path: encoded, HEVC: mov, Width: first.Rect.Dx(), Height: first.Rect.Dy(), FrameRate: rate})
 	if err != nil {
 		return err
 	}
@@ -334,6 +343,12 @@ func exportMovie(ctx context.Context, target string, hevc bool, times []float64,
 	}
 	if err = encoder.Finish(); err != nil {
 		return E.Cause(err, "graphics: finish the video")
+	}
+	if mov {
+		if err = movie.Remux(encoded, target); err != nil {
+			os.Remove(target)
+			return E.Cause(err, "graphics: write the QuickTime movie")
+		}
 	}
 	return nil
 }

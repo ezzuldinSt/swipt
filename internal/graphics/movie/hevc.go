@@ -214,6 +214,10 @@ func parseSPS(sps []byte) (spsInfo, error) {
 	return info, nil
 }
 
+func (f *Format) description() description {
+	return description{codec: HEVC, entry: "hvc1", box: "hvcC", name: "HEVC", configuration: f.configuration(), width: f.Width, height: f.Height}
+}
+
 // configuration is the HEVCDecoderConfigurationRecord of an hvcC box, with the VPS, SPS and
 // PPS in arrays marked complete, and NAL units behind 4-byte lengths.
 func (f *Format) configuration() []byte {
