@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"regexp"
 	"slices"
 	"strconv"
@@ -338,9 +339,125 @@ func (v *View) Find(scope string, selector *Selector, callbacks Callbacks) (*Vie
 		return nil, err
 	}
 	if len(found) > 1 {
-		return nil, E.New(selector.String(), " is not unique: ", len(found), " elements match")
+		return nil, E.New(selector.String(), " is not unique: ", len(found), " elements match: ", candidates(found))
 	}
 	return found[0], nil
+}
+
+// Best finds the match an action most likely means, ranked by rankOf, and
+// those it cannot tell from it, all in the order of the tree; it answers no
+// elements when none matches.
+func (v *View) Best(scope string, selector *Selector, callbacks Callbacks) ([]*ViewElement, error) {
+	found, err := v.FindAll(scope, selector, callbacks)
+	if err != nil || len(found) < 2 {
+		return found, err
+	}
+	return best(found), nil
+}
+
+// Unique finds the one match an action means, failing when the ranking cannot
+// tell several apart rather than acting on one of them blindly.
+func (v *View) Unique(scope string, selector *Selector, callbacks Callbacks) (*ViewElement, error) {
+	found, err := v.Best(scope, selector, callbacks)
+	switch {
+	case err != nil || len(found) == 0:
+		return nil, err
+	case len(found) > 1:
+		return nil, E.New(selector.String(), " matches ", len(found), " elements that rank alike: ", candidates(found), "; add a field, within or index to pick one")
+	}
+	return found[0], nil
+}
+
+type rank struct {
+	flags int
+	area  float64
+}
+
+// A match is likelier the one meant when it shows on the screen, then when
+// nothing covers it and no modal view keeps it inert, then when it is enabled,
+// then when it is a control or holds actions rather than text or a container;
+// among those alike, one at least twice the size of another wins.
+const rankSize = 2
+
+func rankOf(element *ViewElement) rank {
+	node := element.node
+	shown := node != nil && node.Shown()
+	out := rank{}
+	for _, flag := range []bool{
+		shown,
+		shown && !node.Covered && !element.Inert,
+		!element.Disabled,
+		isControl(element.Role) || element.Role == "cell" || len(element.Actions) > 0 ||
+			slices.Contains(element.Traits, "button") || slices.Contains(element.Traits, "link"),
+	} {
+		out.flags <<= 1
+		if flag {
+			out.flags |= 1
+		}
+	}
+	if shown {
+		out.area = node.Visible.area()
+	}
+	return out
+}
+
+func best(found []*ViewElement) []*ViewElement {
+	ranks := make([]rank, len(found))
+	top := rank{flags: -1}
+	for index, element := range found {
+		ranks[index] = rankOf(element)
+		if it := ranks[index]; it.flags > top.flags || it.flags == top.flags && it.area > top.area {
+			top = it
+		}
+	}
+	var out []*ViewElement
+	for index, element := range found {
+		if it := ranks[index]; it.flags == top.flags && (it.area == top.area || it.area*rankSize > top.area) {
+			out = append(out, element)
+		}
+	}
+	return out
+}
+
+const listedCandidates = 6
+
+func candidates(found []*ViewElement) string {
+	parts := make([]string, 0, min(len(found), listedCandidates))
+	for _, element := range found[:min(len(found), listedCandidates)] {
+		parts = append(parts, element.String())
+	}
+	out := strings.Join(parts, "; ")
+	if len(found) > listedCandidates {
+		out += "; and " + strconv.Itoa(len(found)-listedCandidates) + " more"
+	}
+	return out
+}
+
+// String describes the element on one line, as the line of the JavaScript
+// element's toString.
+func (e *ViewElement) String() string {
+	parts := []string{e.Role}
+	if e.Label != "" {
+		parts = append(parts, quote(clipText(e.Label)))
+	}
+	if e.ShownValue != nil && *e.ShownValue != "" {
+		parts = append(parts, "value="+quote(clipText(*e.ShownValue)))
+	}
+	if e.Identifier != "" {
+		parts = append(parts, "id="+quote(e.Identifier))
+	}
+	if e.Frame != nil {
+		parts = append(parts, "["+strings.Join(common.Map(e.Frame[:], func(value float64) string { return strconv.Itoa(int(math.Round(value))) }), ",")+"]")
+	}
+	for _, flag := range lineFlags {
+		if flag.set(e) {
+			parts = append(parts, flag.name)
+		}
+	}
+	if e.node != nil && e.node.Covered {
+		parts = append(parts, "covered")
+	}
+	return strings.Join(parts, " ")
 }
 
 func (v *View) domain(scope string) (domain, universe []*ViewElement, err error) {
