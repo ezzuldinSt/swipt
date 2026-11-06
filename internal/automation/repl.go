@@ -163,6 +163,7 @@ func (r *REPL) session() (*engine, error) {
 }
 
 func (r *REPL) Execute(ctx context.Context, script Script, timeout time.Duration, emit func(Output)) error {
+	r.host.prewarmGraphics()
 	e, err := r.session()
 	if err != nil {
 		return err

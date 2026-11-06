@@ -138,6 +138,14 @@ func New(options Options) *Graphics {
 	return g
 }
 
+// Prewarm opens the live feed in the background, or keeps it open longer, so
+// the screen calls of a script that starts find it streaming.
+func (g *Graphics) Prewarm() {
+	if g.feed != nil {
+		g.feed.Prewarm()
+	}
+}
+
 // lease takes the live feed for a screen call, or nothing to read the screen
 // with screenshots.
 func (g *Graphics) lease(ctx context.Context) *feed.Lease {
