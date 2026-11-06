@@ -40,6 +40,7 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
+	runInForeground(options.Logs.NewLogger("server"))
 	directory, caches, err := directories()
 	if err != nil {
 		return err
