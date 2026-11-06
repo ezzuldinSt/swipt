@@ -19,15 +19,8 @@ import (
 
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/swipt-automation/swipt/internal/automation"
-	"github.com/swipt-automation/swipt/internal/device"
-	"github.com/swipt-automation/swipt/internal/log"
+	"github.com/swipt-automation/swipt/internal/jsc"
 )
-
-type Options struct {
-	Connection        *device.Connection
-	Logger            log.ContextLogger
-	OnRecordingFailed func(message string)
-}
 
 type Graphics struct {
 	options Options
@@ -42,8 +35,18 @@ func New(options Options) *Graphics {
 	return graphics
 }
 
-func (g *Graphics) Entry() uintptr {
-	return uintptr(unsafe.Pointer(C.swipt_graphics_native))
+// The commands of swipt_graphics_native (SWEntry.m).
+const (
+	commandInstall int32 = iota
+	commandUninstall
+)
+
+func (g *Graphics) Install(context *jsc.Context, native jsc.Value, engine uint64) {
+	context.RunNative(uintptr(unsafe.Pointer(C.swipt_graphics_native)), commandInstall, native, engine)
+}
+
+func (g *Graphics) Uninstall(context *jsc.Context, engine uint64) {
+	context.RunNative(uintptr(unsafe.Pointer(C.swipt_graphics_native)), commandUninstall, jsc.Value{}, engine)
 }
 
 func (g *Graphics) Run(engine uint64, call int64, context *automation.GraphicsCall) (json.RawMessage, error) {
