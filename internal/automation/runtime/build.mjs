@@ -29,7 +29,7 @@ const chunks = Object.fromEntries(
           `the Chunks member ${JSON.stringify(line.trim())} is not NAME: typeof import("MODULE")`,
         );
       }
-      return [name, path.join("src/extension", `${module}.ts`)];
+      return [name, path.posix.join("src/extension", `${module}.ts`)];
     }),
 );
 
@@ -97,7 +97,11 @@ const linked = {
         resolveDir: args.resolveDir,
         pluginData: linked,
       });
-      const id = path.relative(process.cwd(), resolved.path);
+      // esbuild names its inputs with forward slashes on Windows too.
+      const id = path
+        .relative(process.cwd(), resolved.path)
+        .split(path.sep)
+        .join("/");
       if (resolved.errors.length > 0 || !core.has(id)) {
         return undefined;
       }
@@ -240,7 +244,7 @@ const typeFiles = new Set(
   fs
     .readdirSync("src/extension/types", { recursive: true })
     .filter((file) => file.endsWith(".d.ts"))
-    .map((file) => file.slice(0, -".d.ts".length)),
+    .map((file) => file.split(path.sep).join("/").slice(0, -".d.ts".length)),
 );
 const ambientModule = (specifier, text) => {
   const body = text
