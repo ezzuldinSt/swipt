@@ -1,7 +1,7 @@
 package feed
 
-// What the stream says about itself: its parameter sets read to the colors of the SPS's VUI
-// (ITU-T H.265 7.3.2.2, E.2.1).
+// What the stream says about itself: its parameter sets, read to the colors of the SPS's VUI,
+// and its slice segment headers (ITU-T H.265 7.3.2.2, 7.3.2.3, 7.3.6.1, E.2.1).
 
 // nalReader reads the RBSP of a NAL unit, dropping its emulation prevention bytes (H.265
 // 7.4.2) as it goes, so a long NAL unit is read without copying it.
@@ -94,6 +94,36 @@ func (r *nalReader) se() int32 {
 	return -int32(value / 2)
 }
 
+// align drops the rest of the byte, as byte_alignment() after its first bit.
+func (r *nalReader) align() {
+	r.left = 0
+}
+
+// restIsZero tells whether only zero bits follow, as after rbsp_stop_one_bit; cabac_zero_words
+// are zero too.
+func (r *nalReader) restIsZero() bool {
+	if r.bad || r.left > 0 && r.current&(1<<r.left-1) != 0 {
+		return false
+	}
+	r.left = 0
+	for r.load() {
+		if r.current != 0 {
+			return false
+		}
+		r.left = 0
+	}
+	return true
+}
+
+// ceilLog2 is Ceil(Log2(value)).
+func ceilLog2(value int) int {
+	bits := 0
+	for 1<<bits < value {
+		bits++
+	}
+	return bits
+}
+
 // colorDescription is what an SPS's VUI says of the stream's colors (E.3.1): the range when
 // signal is set, and the H.273 code points of its primaries, transfer and matrix when described
 // is set.
@@ -145,6 +175,20 @@ type spsInfo struct {
 	// complete is set when the SPS was read to its extension flags; foreign is set when an
 	// extension (multilayer, 3D, screen content) changes the slice header this reader knows.
 	complete, foreign bool
+}
+
+// chromaArrayType is ChromaArrayType (7.4.3.2.1).
+func (s *spsInfo) chromaArrayType() int {
+	if s.separatePlanes {
+		return 0
+	}
+	return s.chromaFormat
+}
+
+// ctbs is PicWidthInCtbsY and PicHeightInCtbsY.
+func (s *spsInfo) ctbs() (width, height int) {
+	size := 1 << s.log2Ctb
+	return (s.width + size - 1) / size, (s.height + size - 1) / size
 }
 
 func skipProfileTierLevel(r *nalReader, subLayers int) {
