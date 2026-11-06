@@ -526,6 +526,9 @@ func (c *mfCodec) readOutput() error {
 	if err := check("read the decoder's output type", c.transform.call(transformGetOutputCurrentType, 0, uintptr(unsafe.Pointer(&mediaType)))); err != nil {
 		return err
 	}
+	if mediaType == nil {
+		return E.New("the decoder answered no output type")
+	}
 	defer mediaType.release()
 	size, ok := uint64Attribute(mediaType, &attributeFrameSize)
 	if !ok || size>>32 == 0 || uint32(size) == 0 {
