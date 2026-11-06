@@ -64,6 +64,7 @@ type Mark struct {
 	front      uint64
 	generation uint64
 	element    *accessibility.Element
+	displaced  string
 }
 
 // Reaction is what the device reports changed after an input.
@@ -163,6 +164,10 @@ type HitElement struct {
 	Value      string `json:"value,omitempty"`
 	Identifier string `json:"identifier,omitempty"`
 	Role       string `json:"role"`
+	// Frame and Point are where a read of the screen placed the element, for
+	// an element of a current read.
+	Frame *[4]float64 `json:"frame,omitempty"`
+	Point *[2]float64 `json:"point,omitempty"`
 }
 
 // HitTest answers the element a tap at each point would reach, nil where the
@@ -210,6 +215,9 @@ func (p *Phone) HitTest(ctx context.Context, points []Point) ([]*HitElement, err
 			if answer != nil && answer.Code == 0 {
 				ax := answer.Value
 				out[index] = &HitElement{Label: PlainText(ax.Label), Value: PlainText(ax.Value), Identifier: ax.Identifier, Role: roleOf(ax)}
+				if node := c.nodes.find(hits[index].Value.Ref, c.ax.current()); node != nil && node.Shown() {
+					out[index].Frame, out[index].Point = new(rectArray(node.Frame)), new(pointArray(node.Point))
+				}
 			}
 		}
 		return nil

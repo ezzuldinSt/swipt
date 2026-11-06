@@ -22,10 +22,10 @@ const (
 	// A change at the target counts this far around it, where a control's
 	// pressed look spreads past its frame.
 	targetMargin = 8.0
-	// After a change elsewhere, the target has this long to change too: a
-	// pushed view and the highlight of the row that pushed it come in the same
-	// few frames.
-	targetGrace = 250 * time.Millisecond
+	// A change counts once it still shows this long after it first does: a
+	// press highlight, or the bounce of a Home Screen icon tapped on its label,
+	// goes back sooner, while a pushed view or a launch stays.
+	persistHold = 350 * time.Millisecond
 )
 
 var _ automation.ScreenWatcher = (*Graphics)(nil)
@@ -94,6 +94,9 @@ func comparisonOf(ctx context.Context, reference *raster.Image, region raster.Re
 	return comparison, plane, nil
 }
 
+// Change answers where the frames first changed from the mark's, once the
+// change has held for persistHold: a press highlight or an icon's bounce that
+// goes back to the marked look by then is "transient", not an effect.
 func (w *screenWatch) Change(ctx context.Context, target device.Rect, until time.Time) (string, time.Duration, error) {
 	screen := w.reference.Frame()
 	near, nearBefore, err := comparisonOf(ctx, w.reference, raster.Rect{target.X - targetMargin, target.Y - targetMargin, target.Width + 2*targetMargin, target.Height + 2*targetMargin})
@@ -104,45 +107,64 @@ func (w *screenWatch) Change(ctx context.Context, target device.Rect, until time
 	if err != nil {
 		return "", 0, err
 	}
-	var elsewhere time.Duration
-	var deadline time.Time
+	classify := func(frame *raster.Image) (string, error) {
+		for _, it := range []struct {
+			comparison *raster.Comparison
+			before     *image.Gray
+			where      string
+		}{{near, nearBefore, automationTarget}, {whole, wholeBefore, automationElsewhere}} {
+			if it.comparison == nil {
+				continue
+			}
+			plane, err := it.comparison.Plane(ctx, frame)
+			if err != nil {
+				return "", err
+			}
+			if it.comparison.Changed(it.before, plane) {
+				return it.where, nil
+			}
+		}
+		return "", nil
+	}
+	var first time.Duration
+	var judge time.Time
+	var last *raster.Image
 	for {
 		wait := until
-		if !deadline.IsZero() && deadline.Before(wait) {
-			wait = deadline
+		if !judge.IsZero() {
+			wait = judge
 		}
 		frame, err := w.frames.Next(ctx, wait)
 		if err != nil {
 			return "", 0, err
 		}
-		if frame == nil {
-			if elsewhere != 0 {
-				return automationElsewhere, elsewhere, nil
+		if frame != nil {
+			last = frame
+			if judge.IsZero() {
+				where, err := classify(frame)
+				if err != nil {
+					return "", 0, err
+				}
+				if where != "" {
+					first, judge = max(w.since(frame), time.Millisecond), time.Now().Add(persistHold)
+				}
+				continue
 			}
+			if time.Now().Before(judge) {
+				continue
+			}
+		}
+		if judge.IsZero() {
 			return "", 0, nil
 		}
-		after := w.since(frame)
-		if near != nil {
-			plane, err := near.Plane(ctx, frame)
-			if err != nil {
-				return "", 0, err
-			}
-			if near.Changed(nearBefore, plane) {
-				return automationTarget, after, nil
-			}
+		where, err := classify(last)
+		if err != nil {
+			return "", 0, err
 		}
-		if elsewhere == 0 && whole != nil {
-			plane, err := whole.Plane(ctx, frame)
-			if err != nil {
-				return "", 0, err
-			}
-			if whole.Changed(wholeBefore, plane) {
-				elsewhere, deadline = max(after, time.Millisecond), time.Now().Add(targetGrace)
-				if near == nil {
-					return automationElsewhere, elsewhere, nil
-				}
-			}
+		if where == "" {
+			return automation.ChangeTransient, first, nil
 		}
+		return where, first, nil
 	}
 }
 

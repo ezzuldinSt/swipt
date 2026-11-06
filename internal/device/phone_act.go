@@ -57,11 +57,17 @@ type axSession struct {
 	settled   time.Time
 	animating bool
 	moved     bool
-	stale     bool
-	reread    SnapshotOptions
-	fixed     bool
-	blocker   *blocker
-	retry     *Point
+	settling  bool
+	steady    bool
+	rereads   int
+
+	previousAt  time.Time
+	steadyUntil time.Time
+	stale       bool
+	reread      SnapshotOptions
+	fixed       bool
+	blocker     *blocker
+	retry       *Point
 }
 
 func (s *axSession) tap(ctx context.Context, at Point, count int, hold time.Duration) error {
