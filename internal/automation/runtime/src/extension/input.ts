@@ -1,30 +1,50 @@
-import { act, check, optionsOf, point, type Options } from "./options";
+import { invoke } from "./async";
+import { observed, observeOf, tapResultOf, type RawTap } from "./accessibility";
+import {
+  act,
+  check,
+  optionsOf,
+  point,
+  signalOf,
+  type Options,
+} from "./options";
 
 const button = (name: string) => (options?: Options) =>
   act("input.button", [name], check(options, []));
 
-export const tap = (at: unknown, options?: Options) =>
-  act(
+export const tap = async (at: unknown, options?: Options) => {
+  const { observe, verify, ...rest } = optionsOf(options, [
+    "count",
+    "verify",
+    "observe",
+  ]);
+  if (verify !== undefined && typeof verify !== "boolean") {
+    throw new TypeError("verify must be a boolean");
+  }
+  const watched = observeOf(observe);
+  const signal = signalOf(options);
+  const raw = await invoke<RawTap | null>(
     "input.tap",
-    [point(at, "the point"), optionsOf(options, ["count"])],
-    options,
-  );
-export const swipe = (from: unknown, to: unknown, options?: Options) =>
-  act(
-    "input.swipe",
-    [point(from, "from"), point(to, "to"), optionsOf(options, ["durationMs"])],
-    options,
-  );
-export const drag = (from: unknown, to: unknown, options?: Options) =>
-  act(
-    "input.drag",
     [
-      point(from, "from"),
-      point(to, "to"),
-      optionsOf(options, ["durationMs", "pressMs"]),
+      point(at, "the point"),
+      { ...rest, verify: verify === true || watched !== undefined },
     ],
-    options,
+    { signal },
   );
+  return observed(tapResultOf(raw), watched, signal);
+};
+
+const moved =
+  (operation: string, allowed: string[]) =>
+  async (from: unknown, to: unknown, options?: Options) => {
+    const { observe, ...rest } = optionsOf(options, [...allowed, "observe"]);
+    const watched = observeOf(observe);
+    await act(operation, [point(from, "from"), point(to, "to"), rest], options);
+    return observed({}, watched, signalOf(options));
+  };
+
+export const swipe = moved("input.swipe", ["durationMs"]);
+export const drag = moved("input.drag", ["durationMs", "pressMs"]);
 export const pinch = (center: unknown, scale: number, options?: Options) =>
   act(
     "input.pinch",

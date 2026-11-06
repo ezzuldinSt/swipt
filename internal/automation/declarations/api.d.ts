@@ -272,6 +272,7 @@ declare module "@swipt/api/file-system" {
 
 declare module "@swipt/api/accessibility" {
   import type { CallOptions, Point, Rect } from "@swipt/api";
+  import type { RasterImage } from "@swipt/api/image";
 
   export type AccessibilityTrait =
     | "button"
@@ -395,6 +396,8 @@ declare module "@swipt/api/accessibility" {
     /** Reads again as soon as a read ends. Without it, a read waits for the device's next screen push, which comes 0.75 s after a change at the soonest and not at all for a change that adds or removes no element. */
     readonly poll?: boolean;
     readonly pollTimeoutMs?: number;
+    /** When the reads match nothing, scrolls the front app's largest scroll view a page at a time, down to its end and then up to its top, reading the screen after each page; throws NotFoundError naming the scroll view and the pages it went through, rather than answering null. */
+    readonly scroll?: boolean;
   }
 
   export function snapshot(
@@ -410,11 +413,62 @@ declare module "@swipt/api/accessibility" {
     readonly timeoutMs?: number;
   }
 
-  /** A selector picks its match as find does, and throws when several rank alike, listing them. */
+  /** What an action settled on, with `observe`. */
+  export interface Observation {
+    /** False when the screen kept changing for 3 s after the action, and the frame or snapshot is of it moving. */
+    readonly settled?: boolean;
+    /** With `observe: "snapshot"`: the front app, read once the screen stopped changing for 300 ms. */
+    readonly snapshot?: AccessibilitySnapshot;
+    /** With `observe: "frame"`: the frame the screen settled on. */
+    readonly frame?: RasterImage;
+  }
+
+  export interface ObserveOptions {
+    /** After the action, waits for the screen to change and then to stay still for 300 ms (at most 3 s), and answers its snapshot or frame in the result, so one call acts and reads. */
+    readonly observe?: "snapshot" | "frame";
+  }
+
+  /** "target": the screen changed at the element (or within 44 pt of a tapped point) after the touch; "elsewhere": it changed only away from it, or the device reported the element went, moved or another app came to the front; "none": nothing changed within 800 ms. A correct tap can change nothing visible, as on a control already in that state, so "none" is advice, not an error. */
+  export type TapEffect = "target" | "elsewhere" | "none";
+
+  export interface TapAttempt {
+    /** "tap", "saferTap" (at the element's visible edge farthest from the app's bars), "scroll" (bringing it 80 pt clear of the bars) or "press" (its accessibility action). */
+    readonly method: "tap" | "saferTap" | "scroll" | "press";
+    readonly point?: Point;
+    readonly effect?: TapEffect;
+    readonly detail?: string;
+  }
+
+  export interface TapResult extends Observation {
+    /** The element tapped, as "the element \"General\"". */
+    readonly element?: string;
+    /** Where the first touch went. */
+    readonly point?: Point;
+    /** What the tap changed; missing when it was not watched. */
+    readonly effect?: TapEffect;
+    /** How the effect showed, such as "the screen changed at it 214 ms after the touch". */
+    readonly detail?: string;
+    /** Every try, when the tap scrolled the element into view or tried again. */
+    readonly attempts?: readonly TapAttempt[];
+  }
+
+  export interface TapElementOptions extends ElementOptions, ObserveOptions {
+    /**
+     * Watches the screen and the element for up to 800 ms after the touch and reports the effect; on by default.
+     * When nothing changed, tries again in turn: at a safer point of the element, after scrolling it clear of the app's bars, and with its press action, stopping at the first that changes something.
+     * An element whose label or identifier names an irreversible or outward action (Send, Pay, Buy, Delete, Remove, Reset, Confirm, Allow, Call, Post, Share, Sign Out and the like) is never tried again.
+     * False taps once and reports no effect, as before.
+     */
+    readonly verify?: boolean;
+    /** With a selector that matches nothing on the screen, searches the pages of the screen as find's `scroll` does. */
+    readonly scroll?: boolean;
+  }
+
+  /** A selector picks its match as find does, and throws when several rank alike, listing them. An element off the screen or under the app's own bars, in a scroll view, is first scrolled 80 pt clear of the bars. */
   export function tap(
     element: AccessibilityElement | AccessibilitySelector,
-    options?: ElementOptions,
-  ): Promise<void>;
+    options?: TapElementOptions,
+  ): Promise<TapResult>;
   export function setText(
     element: AccessibilityElement | AccessibilitySelector,
     text: string,
@@ -429,9 +483,12 @@ declare module "@swipt/api/accessibility" {
 
 declare module "@swipt/api/input" {
   import type { CallOptions, Point } from "@swipt/api";
+  import type { Observation, ObserveOptions, TapResult } from "@swipt/api/accessibility";
 
-  export interface TapOptions extends CallOptions {
+  export interface TapOptions extends CallOptions, ObserveOptions {
     readonly count?: number;
+    /** Watches the screen for up to 800 ms after the touch and reports in `effect` whether it changed within 44 pt of the point or elsewhere; `observe` implies it. It never taps again. */
+    readonly verify?: boolean;
   }
 
   export type KeyboardKey =
@@ -455,17 +512,23 @@ declare module "@swipt/api/input" {
     KeyboardKey | `${KeyboardModifier}+${KeyboardKey}` | (string & {});
   export type TouchSample = [x: number, y: number, ms: number];
 
-  export function tap(point: Point, options?: TapOptions): Promise<void>;
+  /** Answers the point, and with `verify` or `observe` the effect and its detail. */
+  export function tap(
+    point: Point,
+    options?: TapOptions,
+  ): Promise<TapResult>;
+  /** Answers an empty object, or with `observe` what the scroll settled on. */
   export function swipe(
     from: Point,
     to: Point,
-    options?: CallOptions & { durationMs?: number },
-  ): Promise<void>;
+    options?: CallOptions & ObserveOptions & { durationMs?: number },
+  ): Promise<Observation>;
   export function drag(
     from: Point,
     to: Point,
-    options?: CallOptions & { durationMs?: number; pressMs?: number },
-  ): Promise<void>;
+    options?: CallOptions &
+      ObserveOptions & { durationMs?: number; pressMs?: number },
+  ): Promise<Observation>;
   export function pinch(
     center: Point,
     scale: number,
