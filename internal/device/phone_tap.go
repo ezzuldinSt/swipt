@@ -3,6 +3,7 @@ package device
 import (
 	"context"
 	"math"
+	"slices"
 	"strconv"
 	"time"
 
@@ -62,14 +63,20 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 		return Aim{}, err
 	}
 	defer grant.release()
+	pushes, unsubscribe := c.events.subscribe()
+	defer unsubscribe()
 	started := time.Now()
 	s := &axSession{phone: p, conn: c, geometry: geometry, grant: grant, settled: started.Add(animationLimit)}
 	var deadline time.Time
 	if timeout >= 0 {
 		deadline = started.Add(timeout)
 	}
+	var alerts []uint64
 	refuse := func(pending, after string, cause error) (Aim, error) {
 		p.connection.trace(started, name+".refused", pending, time.Since(started))
+		if text := p.interrupted(ctx, c, geometry, s.blocker, append(alerts, alerted(pushes)...)); text != "" {
+			pending += "; in the way: " + text
+		}
 		if cause == nil {
 			return s.target, E.New(pending, after)
 		}
@@ -103,6 +110,7 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 			break
 		}
 		waited = pending
+		alerts = append(alerts, alerted(pushes)...)
 		delay = min(max(delay*2, pollFirst), pollLongest)
 		if s.animating {
 			delay = pollFirst
@@ -140,7 +148,7 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, error) {
 	name := describeElement(target.AX)
 	s.target = Aim{Element: name, Point: target.Point, Secure: target.AX.Secure()}
-	s.animating, s.stale, s.fixed = false, false, false
+	s.animating, s.stale, s.fixed, s.blocker = false, false, false, nil
 	if !target.HasFrame() {
 		return Point{}, "", E.New(name, " has no position on the screen; perform one of its actions instead")
 	}
@@ -214,8 +222,10 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 		hit.Value = element.Value
 	}
 	if target.Inert {
+		s.blocker = &blocker{pid: target.AX.Ref.PID, modal: true}
 		return Point{}, name + " is behind a modal view, as a sheet or an alert", nil
 	}
+	s.blocker = &blocker{pid: hit.Value.Ref.PID, ref: &hit.Value.Ref}
 	return Point{}, "a tap at " + pointText(at) + " would reach " + describeElement(hit.Value) + ", not " + name, nil
 }
 
@@ -223,6 +233,22 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 // script scrolls it, so a tap gives up on it once a transition would have
 // ended.
 const coverLimit = animationLimit
+
+// alerted lists the processes that posted an alert notification among the
+// events received.
+func alerted(pushes <-chan Event) []uint64 {
+	var out []uint64
+	for {
+		select {
+		case event := <-pushes:
+			if event.Kind == EventAccessibility && event.Notification == notificationAlert && event.PID != 0 && !slices.Contains(out, event.PID) {
+				out = append(out, event.PID)
+			}
+		default:
+			return out
+		}
+	}
+}
 
 func sameWindow(target *PhoneNode, hit accessibility.Element) bool {
 	context := hit.Context

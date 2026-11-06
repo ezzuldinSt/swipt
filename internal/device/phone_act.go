@@ -54,6 +54,7 @@ type axSession struct {
 	animating bool
 	stale     bool
 	fixed     bool
+	blocker   *blocker
 }
 
 func (s *axSession) tap(ctx context.Context, at Point, count int, hold time.Duration) error {
