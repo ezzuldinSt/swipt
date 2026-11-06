@@ -445,13 +445,14 @@ declare module "@swipt/api/accessibility" {
   }
 
   export interface TapElementOptions extends ElementOptions, ObserveOptions {
-    /**
-     * Watches the screen and the element for up to 800 ms after the touch and reports the effect; on by default.
-     * When nothing changed, tries again in turn: at a safer point of the element, after scrolling it clear of the app's bars, and with its press action, stopping at the first that changes something.
-     * An element whose label or identifier names an irreversible or outward action (Send, Pay, Buy, Delete, Remove, Reset, Confirm, Allow, Call, Post, Share, Sign Out and the like) is never tried again.
-     * False taps once and reports no effect, as before.
-     */
+    /** Watches the screen and the element for up to 800 ms after the touch and reports the effect; on by default. False taps once and reports no effect, as before. */
     readonly verify?: boolean;
+    /**
+     * With verify, when nothing changed and the tap's point was in doubt, tries again in turn: at a safer point of the element, after scrolling it clear of the app's bars, and with its press action, stopping at the first that changes something; on by default.
+     * The point is in doubt when the element was partial or off the screen, lay within 80 pt of the app's bars or by a cover, moved or animated before the tap, or the hit test answered another element.
+     * A whole, clear and steady element is never tried again: its tap may rightly change nothing, or show it after 800 ms, and a second tap would act twice. Nor is an element already selected, or one whose label or identifier names an irreversible or outward action (Send, Pay, Buy, Delete, Remove, Reset, Confirm, Allow, Call, Post, Share, Sign Out and the like, in English).
+     */
+    readonly recover?: boolean;
     /** With a selector that matches nothing on the screen, searches the pages of the screen as find's `scroll` does. */
     readonly scroll?: boolean;
   }

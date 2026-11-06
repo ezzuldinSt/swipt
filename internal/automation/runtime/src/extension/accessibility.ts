@@ -416,14 +416,19 @@ export const tapResultOf = (raw: RawTap | null): TapResult => {
 
 export const tap = async (element: unknown, options?: Options) => {
   const target = elementOf(element, "accessibility.tap");
-  const { timeoutMs, verify, observe, scroll } = optionsOf(options, [
+  const { timeoutMs, verify, recover, observe, scroll } = optionsOf(options, [
     "timeoutMs",
     "verify",
+    "recover",
     "observe",
     "scroll",
   ]);
   const limit = limitOf(timeoutMs, "timeoutMs");
   const checked = flagOf(verify, "verify", true);
+  const recovering = flagOf(recover, "recover", checked);
+  if (recovering && !checked) {
+    throw new TypeError("recover applies with verify");
+  }
   const watched = observeOf(observe);
   const signal = signalOf(options);
   const raw = await on(
@@ -435,7 +440,11 @@ export const tap = async (element: unknown, options?: Options) => {
     (ref, left) =>
       invoke<RawTap | null>(
         "accessibility.tap",
-        [ref, left === Infinity ? null : left, { verify: checked }],
+        [
+          ref,
+          left === Infinity ? null : left,
+          { verify: checked, recover: recovering },
+        ],
         { signal },
       ),
   );

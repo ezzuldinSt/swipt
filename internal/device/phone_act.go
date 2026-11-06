@@ -52,6 +52,7 @@ type axSession struct {
 	target    Aim
 	settled   time.Time
 	animating bool
+	moved     bool
 	stale     bool
 	fixed     bool
 	blocker   *blocker

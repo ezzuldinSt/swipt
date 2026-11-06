@@ -215,6 +215,7 @@ func (n *PhoneNode) place(covers []cover) {
 	if len(covers) == 0 || clearance(n.Point, covers) >= coverClearance {
 		return
 	}
+	n.overlapped = true
 	cuts := func(margin float64) []Rect {
 		out := make([]Rect, len(covers))
 		for index, it := range covers {
