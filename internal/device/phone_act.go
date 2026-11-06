@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 
@@ -348,20 +349,14 @@ func (p *Phone) act(ctx context.Context, do action) error {
 	}
 	defer done()
 	connected := time.Now()
-	if do.unlocked {
-		if err = p.requireScreen(ctx, c); err != nil {
-			return err
-		}
-	}
-	checked := time.Now()
-	geometry, err := c.readGeometry(ctx)
+	geometry, err := p.prepare(ctx, c, do.unlocked)
 	if err != nil {
 		return err
 	}
 	prepared := time.Now()
 	err = do.input(ctx, c, geometry)
 	p.connection.trace(prepared, do.name, "prepared in "+prepared.Sub(began).String()+": connection "+connected.Sub(began).String()+
-		", lock and backlight "+checked.Sub(connected).String()+", geometry "+prepared.Sub(checked).String(), time.Since(prepared))
+		", geometry, lock and backlight "+prepared.Sub(connected).String(), time.Since(prepared))
 	c.events.publish(Event{Kind: EventInput})
 	c.front.acted()
 	if err != nil {
@@ -388,22 +383,35 @@ func (p *Phone) gesture(ctx context.Context, c *conn, send func(input *hid.Clien
 	return err
 }
 
-func (p *Phone) requireScreen(ctx context.Context, c *conn) error {
-	locked, err := c.lockState.recent(ctx)
-	if err != nil {
-		return E.Cause(err, "read the lock state")
+// prepare reads what input needs first: the geometry and, for input that needs
+// an unlocked screen, the lock and backlight state. Each comes from its cache
+// while that is current. The lock state is read alongside the others, and a
+// geometry read brings the backlight state with it.
+func (p *Phone) prepare(ctx context.Context, c *conn, unlocked bool) (phoneGeometry, error) {
+	var locked bool
+	var lockErr error
+	var lockRead sync.WaitGroup
+	if unlocked {
+		lockRead.Go(func() { locked, lockErr = c.lockState.recent(ctx) })
 	}
-	if locked {
-		return E.Extend(ErrLocked, "unlock it first")
+	geometry, err := c.readGeometry(ctx)
+	var display string
+	var displayErr error
+	if unlocked {
+		display, displayErr = c.recentBacklight(ctx)
 	}
-	display, err := c.backlight(ctx)
-	if err != nil {
-		return err
+	lockRead.Wait()
+	switch {
+	case lockErr != nil:
+		return phoneGeometry{}, E.Cause(lockErr, "read the lock state")
+	case locked:
+		return phoneGeometry{}, E.Extend(ErrLocked, "unlock it first")
+	case displayErr != nil:
+		return phoneGeometry{}, displayErr
+	case display == "off":
+		return phoneGeometry{}, E.Extend(ErrLocked, "the screen is off; press Home to wake it first")
 	}
-	if display == "off" {
-		return E.Extend(ErrLocked, "the screen is off; press Home to wake it first")
-	}
-	return nil
+	return geometry, err
 }
 
 func (p *Phone) TapPoint(ctx context.Context, at Point, count int) error {
@@ -475,6 +483,7 @@ func (p *Phone) Button(ctx context.Context, name string) error {
 		name: "button " + name,
 		input: func(ctx context.Context, c *conn, _ phoneGeometry) error {
 			defer c.lockState.forget()
+			defer c.backlightCache.invalidate()
 			return p.gesture(ctx, c, func(input *hid.Client) error {
 				for index, button := range buttons {
 					if index > 0 {

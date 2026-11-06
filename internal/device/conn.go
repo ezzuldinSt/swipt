@@ -39,6 +39,8 @@ type conn struct {
 	lockState   lockStateReader
 	viewingWake chan struct{}
 
+	backlightCache backlightCache
+
 	geometryAccess sync.Mutex
 	geometry       phoneGeometry
 	geometryAt     time.Time
@@ -71,6 +73,7 @@ func newConn(s *Connection, session context.Context, device *coredevice.Device, 
 	go c.watchScreenViewing(received, func() { unsubscribe(); unwatch() }, relayDone)
 	go c.ax.run()
 	go func() { _, _ = c.lockState.recent(ctx) }()
+	go c.watchBacklight()
 	return c
 }
 

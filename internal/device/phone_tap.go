@@ -53,10 +53,7 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 		return Aim{}, err
 	}
 	defer done()
-	if err = p.requireScreen(ctx, c); err != nil {
-		return Aim{}, err
-	}
-	geometry, err := c.readGeometry(ctx)
+	geometry, err := p.prepare(ctx, c, true)
 	if err != nil {
 		return Aim{}, err
 	}

@@ -16,6 +16,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/swipt-automation/swipt/internal/coredevice/accessibility"
+	"github.com/swipt-automation/swipt/internal/coredevice/display"
 	"github.com/swipt-automation/swipt/internal/coredevice/hid"
 	"github.com/swipt-automation/swipt/internal/coredevice/pasteboard"
 )
@@ -137,11 +138,30 @@ func (c *conn) readGeometry(ctx context.Context) (phoneGeometry, error) {
 		return c.geometry, nil
 	}
 	asked := time.Now()
-	displays, err := c.display.Displays(ctx)
+	info, err := c.readDisplays(ctx)
 	if err != nil {
 		return phoneGeometry{}, E.Cause(err, "read the device's displays")
 	}
-	primary, found := primaryDisplay(displays)
+	return c.keepGeometryLocked(info, asked)
+}
+
+// readDisplays asks for the displays, keeping the backlight state the answer
+// reports.
+func (c *conn) readDisplays(ctx context.Context) (*display.Info, error) {
+	run, _ := c.darwin.relaying()
+	read := c.backlightCache.begin(run, time.Now())
+	info, err := c.display.Info(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if state, err := info.Backlight(); err == nil {
+		c.backlightCache.store(read, state)
+	}
+	return info, nil
+}
+
+func (c *conn) keepGeometryLocked(info *display.Info, asked time.Time) (phoneGeometry, error) {
+	primary, found := primaryDisplay(info.Displays)
 	if !found {
 		return phoneGeometry{}, E.New("the device lists no usable screen")
 	}
@@ -598,7 +618,7 @@ func (p *Phone) Display(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer done()
-	return c.backlight(ctx)
+	return c.recentBacklight(ctx)
 }
 
 func (p *Phone) Frontmost(ctx context.Context) (string, error) {
@@ -654,24 +674,80 @@ func (p *Phone) WatchForeground(ctx context.Context, emit func(string)) error {
 	}
 }
 
+// backlight reads the backlight state from the device.
 func (c *conn) backlight(ctx context.Context) (string, error) {
-	if read := c.connection.options.BacklightState; read != nil {
-		switch read() {
-		case 0:
-			return "off", nil
-		case 1:
-			return "inactiveOn", nil
-		case 2:
-			return "activeOn", nil
-		case 3:
-			return "dimmed", nil
-		}
+	if state, hooked := c.hookedBacklight(); hooked {
+		return state, nil
 	}
-	state, err := c.display.BacklightState(ctx)
+	return c.readBacklight(ctx)
+}
+
+// recentBacklight answers the backlight state kept from the device's last
+// report while it is current, and reads it otherwise.
+func (c *conn) recentBacklight(ctx context.Context) (string, error) {
+	if state, hooked := c.hookedBacklight(); hooked {
+		return state, nil
+	}
+	run, relaying := c.darwin.relaying()
+	state, current, due := c.backlightCache.cached(time.Now(), run, relaying)
+	if !current {
+		return c.readBacklight(ctx)
+	}
+	if due {
+		c.refreshBacklight()
+	}
+	return state, nil
+}
+
+func (c *conn) hookedBacklight() (string, bool) {
+	read := c.connection.options.BacklightState
+	if read == nil {
+		return "", false
+	}
+	switch read() {
+	case 0:
+		return "off", true
+	case 1:
+		return "inactiveOn", true
+	case 2:
+		return "activeOn", true
+	case 3:
+		return "dimmed", true
+	}
+	return "", false
+}
+
+func (c *conn) readBacklight(ctx context.Context) (string, error) {
+	asked := time.Now()
+	info, err := c.readDisplays(ctx)
 	if err != nil {
 		return "", E.Cause(err, "read the backlight state")
 	}
+	state, err := info.Backlight()
+	if err != nil {
+		return "", E.Cause(err, "read the backlight state")
+	}
+	if c.geometryAccess.TryLock() {
+		if asked.After(c.geometryAt) {
+			_, _ = c.keepGeometryLocked(info, asked)
+		}
+		c.geometryAccess.Unlock()
+	}
 	return state, nil
+}
+
+func (c *conn) refreshBacklight() {
+	if !c.backlightCache.startRefresh() {
+		return
+	}
+	go func() {
+		defer c.backlightCache.endRefresh()
+		ctx, cancel := context.WithTimeout(c.ctx, backlightRefreshLimit)
+		defer cancel()
+		if _, err := c.readBacklight(ctx); err != nil && c.ctx.Err() == nil {
+			c.logger.Debug(E.Cause(err, "refresh the backlight state"))
+		}
+	}()
 }
 
 func (p *Phone) Clipboard(ctx context.Context) (string, bool, error) {
