@@ -97,6 +97,8 @@ type Decoder struct {
 	codec  storedCodec
 	format VideoFormat
 	buffer []byte
+	// color is what the HEVC track's SPS says of its colors, as the live feed reads it.
+	color streamColor
 }
 
 // NewDecoder makes a decoder of a track.
@@ -107,6 +109,9 @@ func NewDecoder(format VideoFormat) (*Decoder, error) {
 		}
 	}
 	d := &Decoder{format: format}
+	if !format.H264 {
+		d.color = streamColor{described: describedColor(format.ParameterSets)}
+	}
 	w, err := startWorker(func() (func(), error) {
 		made, err := newCodec(&parameterSets{width: format.Width, height: format.Height}, codecOptions{software: format.Software, h264: format.H264})
 		if err != nil {
@@ -136,9 +141,10 @@ func (d *Decoder) Name() string {
 	return name
 }
 
-func wrapPictures(pictures []*picture) []*Picture {
+func (d *Decoder) wrapPictures(pictures []*picture) []*Picture {
 	wrapped := make([]*Picture, len(pictures))
 	for index, it := range pictures {
+		d.color.apply(it)
 		wrapped[index] = &Picture{picture: it}
 	}
 	return wrapped
@@ -171,7 +177,7 @@ func (d *Decoder) Decode(nals [][]byte, time int64, keyframe bool, keep func(tim
 	}) {
 		return nil, errClosed
 	}
-	return wrapPictures(pictures), err
+	return d.wrapPictures(pictures), err
 }
 
 // Drain answers the pictures the decoder still holds, at the end of the samples.
@@ -185,7 +191,7 @@ func (d *Decoder) Drain(keep func(time int64) bool) ([]*Picture, error) {
 	}) {
 		return nil, errClosed
 	}
-	return wrapPictures(pictures), err
+	return d.wrapPictures(pictures), err
 }
 
 // Flush drops what the decoder holds before a seek; the next sample must be a keyframe.

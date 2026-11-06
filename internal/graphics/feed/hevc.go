@@ -3,10 +3,11 @@ package feed
 import "bytes"
 
 // parameterSets is the VPS, SPS and PPS a decoder starts from, the first of each in a unit
-// (SWHEVC.m SWHEVCFormat), and the picture size the SPS gives.
+// (SWHEVC.m SWHEVCFormat), and the picture size and colors the SPS gives.
 type parameterSets struct {
 	vps, sps, pps []byte
 	width, height int
+	color         colorDescription
 }
 
 func firstNAL(nals [][]byte, kind int) []byte {
@@ -29,10 +30,24 @@ func readParameterSets(nals [][]byte) (*parameterSets, bool) {
 	if !ok {
 		return nil, false
 	}
-	return &parameterSets{
+	sets := &parameterSets{
 		vps: bytes.Clone(vps), sps: bytes.Clone(sps), pps: bytes.Clone(pps),
 		width: width, height: height,
-	}, true
+	}
+	if parsed, ok := readSPS(sps); ok {
+		sets.color = parsed.color
+	}
+	return sets, true
+}
+
+// describedColor reads the colors of the first SPS among a track's parameter sets.
+func describedColor(nals [][]byte) colorDescription {
+	if sps := firstNAL(nals, nalSPS); sps != nil {
+		if parsed, ok := readSPS(sps); ok {
+			return parsed.color
+		}
+	}
+	return colorDescription{}
 }
 
 func (p *parameterSets) equal(other *parameterSets) bool {
