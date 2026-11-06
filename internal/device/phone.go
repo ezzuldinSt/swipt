@@ -63,6 +63,10 @@ type Phone struct {
 
 	locationAccess sync.Mutex
 	location       *simulatedLocation
+
+	languageAccess sync.Mutex
+	language       string
+	languageAt     time.Time
 }
 
 type simulatedLocation struct {
@@ -540,6 +544,37 @@ func (p *Phone) Info(ctx context.Context) (PhoneInfo, error) {
 	}
 	out.Screen = geometry.PhoneScreen
 	return out, err
+}
+
+// Text recognition reads in the device's language, which a read serves for
+// this long.
+const languageLife = time.Minute
+
+// Language reads the device's language for text recognition, answering the
+// last one read while the device is not connected rather than waiting for it.
+func (p *Phone) Language(ctx context.Context) (string, error) {
+	p.languageAccess.Lock()
+	defer p.languageAccess.Unlock()
+	if p.language != "" && time.Since(p.languageAt) < languageLife {
+		return p.language, nil
+	}
+	if p.Disconnected(time.Now()) {
+		if p.language != "" {
+			return p.language, nil
+		}
+		return "", ErrDisconnected
+	}
+	c, ctx, done, err := p.begin(ctx)
+	if err != nil {
+		return p.language, err
+	}
+	defer done()
+	language, err := c.device.Language(ctx)
+	if err != nil {
+		return p.language, err
+	}
+	p.language, p.languageAt = language, time.Now()
+	return language, nil
 }
 
 func (p *Phone) Locked(ctx context.Context) (bool, error) {

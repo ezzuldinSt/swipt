@@ -76,7 +76,7 @@ func ReadText(ctx context.Context, img Image, options TextOptions) (*Text, error
 		return nil, E.Cause(err, "graphics: load the OCR engine")
 	}
 	defer statics.release()
-	engine, err := newEngine(statics, options.Languages)
+	engine, note, err := newEngine(statics, options.Languages, options.Device)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +109,7 @@ func ReadText(ctx context.Context, img Image, options TextOptions) (*Text, error
 	sin, cos := math.Sincos(angle * math.Pi / 180)
 	centerX, centerY := float64(width)/2+float64(margin), float64(height)/2+float64(margin)
 	unitX, unitY := float64(region.Dx())/float64(width), float64(region.Dy())/float64(height)
-	text := &Text{Lines: []Line{}, place: func(x, y float64) [2]float64 {
+	text := &Text{Lines: []Line{}, Note: note, place: func(x, y float64) [2]float64 {
 		x, y = (x-centerX)*cos-(y-centerY)*sin+centerX, (x-centerX)*sin+(y-centerY)*cos+centerY
 		return s.point(float64(region.Min.X)+(x-float64(margin))*unitX, float64(region.Min.Y)+(y-float64(margin))*unitY)
 	}}
@@ -173,36 +173,90 @@ func sampled(width, height int, scale, minimumHeight float64, limit int) (int, i
 }
 
 // newEngine creates an OcrEngine for the first of preferred that Windows reads, or without
-// preferences for the user's profile languages, as SWDeviceLanguages picks the device's. Windows
-// recognizes one language at a time.
-func newEngine(statics *object, preferred []string) (*object, error) {
-	if len(preferred) == 0 {
-		var engine *object
-		// IOcrEngineStatics::TryCreateFromUserProfileLanguages
-		if err := statics.call(10, uintptr(unsafe.Pointer(&engine))); err != nil {
-			return nil, E.Cause(err, "graphics: create the OCR engine")
-		}
-		if engine != nil {
-			return engine, nil
-		}
-	}
+// preferences for the device's language, as SWDeviceLanguages picks the device's, and else for the
+// user's profile languages, noting the device's language it lacks. Windows recognizes one language
+// at a time.
+func newEngine(statics *object, preferred []string, device string) (*object, string, error) {
 	available, err := languages(statics)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	wanted := preferred
-	if len(wanted) == 0 {
-		wanted = append([]string{"en-US"}, available...)
+	tag, err := pickLanguage(preferred, device, available)
+	if err != nil {
+		return nil, "", err
 	}
-	for _, language := range wanted {
+	if tag != "" {
+		engine, err := engineFor(statics, tag)
+		if err == nil || len(preferred) > 0 {
+			return engine, "", err
+		}
+	}
+	engine, err := profileEngine(statics, available)
+	if err != nil || device == "" {
+		return engine, "", err
+	}
+	used := "the user's profile languages"
+	if tag, err := recognizerLanguage(engine); err == nil {
+		used = tag
+	}
+	return engine, missingNote(device, used), nil
+}
+
+// pickLanguage picks what to read in: the first of preferred Windows has a recognizer for, failing
+// when it has none, or without preferences the device's language; "" stands for the user's profile
+// languages.
+func pickLanguage(preferred []string, device string, available []string) (string, error) {
+	if len(preferred) == 0 {
+		return matchLanguage(device, available), nil
+	}
+	for _, language := range preferred {
+		if tag := matchLanguage(language, available); tag != "" {
+			return tag, nil
+		}
+	}
+	if len(available) == 0 {
+		return "", newError("NotSupportedError", "graphics: Windows has no OCR language installed")
+	}
+	return "", newError("NotSupportedError", "graphics: Windows has no OCR language for %s, only %s", strings.Join(preferred, ", "), strings.Join(available, ", "))
+}
+
+// missingNote names the OCR language pack, a Windows capability, that reading in the device's
+// language needs.
+func missingNote(device, used string) string {
+	language, _ := subtags(device)
+	return fmt.Sprintf("Windows has no OCR language for %s, the device's language, so the text was read in %s; "+
+		"its pack is a Windows capability that Get-WindowsCapability -Online -Name 'Language.OCR~~~%s-*' lists "+
+		"and Add-WindowsCapability -Online -Name <pack> installs as an administrator; or pass languages", device, used, language)
+}
+
+// profileEngine creates an OcrEngine for the user's profile languages, else for en-US or any
+// language Windows reads.
+func profileEngine(statics *object, available []string) (*object, error) {
+	var engine *object
+	// IOcrEngineStatics::TryCreateFromUserProfileLanguages
+	if err := statics.call(10, uintptr(unsafe.Pointer(&engine))); err != nil {
+		return nil, E.Cause(err, "graphics: create the OCR engine")
+	}
+	if engine != nil {
+		return engine, nil
+	}
+	for _, language := range append([]string{"en-US"}, available...) {
 		if tag := matchLanguage(language, available); tag != "" {
 			return engineFor(statics, tag)
 		}
 	}
-	if len(available) == 0 {
-		return nil, newError("NotSupportedError", "graphics: Windows has no OCR language installed")
+	return nil, newError("NotSupportedError", "graphics: Windows has no OCR language installed")
+}
+
+func recognizerLanguage(engine *object) (string, error) {
+	var language *object
+	// IOcrEngine::get_RecognizerLanguage
+	if err := engine.call(7, uintptr(unsafe.Pointer(&language))); err != nil {
+		return "", err
 	}
-	return nil, newError("NotSupportedError", "graphics: Windows has no OCR language for %s, only %s", strings.Join(preferred, ", "), strings.Join(available, ", "))
+	defer language.release()
+	// ILanguage::get_LanguageTag
+	return language.text(6)
 }
 
 func engineFor(statics *object, tag string) (*object, error) {

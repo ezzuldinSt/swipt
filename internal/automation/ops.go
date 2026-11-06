@@ -18,6 +18,7 @@ import (
 
 type operation struct {
 	engine   *engine
+	exec     *execution
 	name     string
 	args     []json.RawMessage
 	recorded []json.RawMessage

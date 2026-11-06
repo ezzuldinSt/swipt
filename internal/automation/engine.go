@@ -482,7 +482,7 @@ func (e *engine) startOperation(arguments []jsc.Value) (any, error) {
 	}
 	ctx, cancel := context.WithCancel(e.current.ctx)
 	e.ops[id] = &pendingOperation{cancel: cancel, exec: e.current}
-	call := &operation{engine: e, name: name, args: args}
+	call := &operation{engine: e, exec: e.current, name: name, args: args}
 	go func() {
 		started := time.Now()
 		value, err := run(ctx, call)
@@ -707,8 +707,13 @@ func (e *engine) print(arguments []jsc.Value) (any, error) {
 }
 
 func (e *engine) log(level log.Level, message string) {
+	e.logTo(e.current, level, message)
+}
+
+// logTo logs for an execution; the goroutines of its operations log with it too.
+func (e *engine) logTo(exec *execution, level log.Level, message string) {
 	name := writeLog(e.logger, level, message)
-	if logs := e.current.logs; logs != nil {
+	if logs := exec.logs; logs != nil {
 		logs(LogEntry{Time: time.Now(), Level: level, Message: message})
 	}
 	if !strings.HasPrefix(e.swiplet.ID, replPrefix) {
