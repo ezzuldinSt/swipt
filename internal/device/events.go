@@ -38,6 +38,8 @@ type events struct {
 	access      sync.Mutex
 	watchers    map[chan struct{}]bool
 	subscribers map[chan Event]func(Event) bool
+	// inputAt is when input was last sent, in nanoseconds since the epoch.
+	inputAt atomic.Int64
 }
 
 func newEvents() *events {
@@ -70,6 +72,9 @@ func (e *events) subscribe(accept func(Event) bool) (<-chan Event, func()) {
 
 func (e *events) publish(event Event) {
 	event.at = time.Now()
+	if event.Kind == EventInput {
+		e.inputAt.Store(event.at.UnixNano())
+	}
 	screen := event.Kind != EventAppState
 	if screen {
 		e.screen.Add(1)
@@ -147,4 +152,21 @@ func (p *Phone) Events(ctx context.Context, emit func(Event)) error {
 			return err
 		}
 	}
+}
+
+// LastInput is when this server last sent the device input, a script's or a viewer's, or the
+// zero time when it has sent none since the device connected. Screen waits right after input
+// give the screen time to answer it.
+func (p *Phone) LastInput() time.Time {
+	s := p.connection
+	s.access.Lock()
+	attached := s.attached
+	s.access.Unlock()
+	if attached == nil {
+		return time.Time{}
+	}
+	if at := attached.events.inputAt.Load(); at != 0 {
+		return time.Unix(0, at)
+	}
+	return time.Time{}
 }

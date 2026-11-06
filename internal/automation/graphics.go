@@ -86,6 +86,15 @@ func (c *GraphicsCall) Language() string {
 	return language
 }
 
+// LastInput is when the device last took input from this server, or the zero time; screen
+// waits right after input give the screen time to answer it.
+func (c *GraphicsCall) LastInput() time.Time {
+	if phone := c.call.engine.host.options.Device; phone != nil {
+		return phone.LastInput()
+	}
+	return time.Time{}
+}
+
 // Warn tells the script, in its console and log, something it should know about the call.
 func (c *GraphicsCall) Warn(message string) {
 	c.call.engine.logTo(c.call.exec, log.LevelWarn, message)

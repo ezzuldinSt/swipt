@@ -143,6 +143,16 @@ const thresholdOf = (value: unknown): number | undefined => {
   return value as number;
 };
 
+const ignoreSizeOf = (value: unknown): number | undefined => {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new RangeError("ignoreSize must be a non-negative number of points");
+  }
+  return value;
+};
+
 const durationOf = (value: unknown, name: string, fallback: number): number => {
   if (value === undefined) {
     return fallback;
@@ -544,18 +554,17 @@ export class ScreenRecording implements ScreenRecordingInterface {
 }
 
 const waitArgs = (options: unknown, extra: string[]) => {
-  const { region, timeoutMs, threshold, ...rest } = optionsOf(options, [
-    "region",
-    "timeoutMs",
-    "threshold",
-    ...extra,
-  ]);
+  const { region, timeoutMs, threshold, ignoreSize, ...rest } = optionsOf(
+    options,
+    ["region", "timeoutMs", "threshold", "ignoreSize", ...extra],
+  );
   return {
     rest,
     args: {
       region: region === undefined ? undefined : rectOf(region, "region"),
       timeoutMs: timeoutOf(timeoutMs),
       threshold: thresholdOf(threshold),
+      ignoreSize: ignoreSizeOf(ignoreSize),
     } as Record<string, unknown>,
   };
 };
@@ -764,7 +773,12 @@ export const waitForStable = (
   options?: WaitOptions & { readonly durationMs?: number },
 ) => {
   const { rest, args } = waitArgs(options, ["durationMs"]);
-  args.durationMs = durationOf(rest.durationMs, "durationMs", 500);
+  // Without one, each engine waits its own quiet time: 500 ms on macOS, 100 ms elsewhere,
+  // where every frame is compared with the quiet stretch's first.
+  args.durationMs =
+    rest.durationMs === undefined
+      ? undefined
+      : durationOf(rest.durationMs, "durationMs", 0);
   return imageResult(run("screen.waitForStable", args, [], signalOf(options)));
 };
 
