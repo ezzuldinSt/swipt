@@ -1,7 +1,10 @@
 import type { CallOptions, Point } from "./index";
+import type { Observation, ObserveOptions, TapResult } from "./accessibility";
 
-export interface TapOptions extends CallOptions {
+export interface TapOptions extends CallOptions, ObserveOptions {
   readonly count?: number;
+  /** Watches the screen for up to 800 ms after the touch and reports in `effect` whether it changed within 44 pt of the point or elsewhere; `observe` implies it. It never taps again. */
+  readonly verify?: boolean;
 }
 
 export type KeyboardKey =
@@ -25,17 +28,23 @@ export type KeyCombination =
   KeyboardKey | `${KeyboardModifier}+${KeyboardKey}` | (string & {});
 export type TouchSample = [x: number, y: number, ms: number];
 
-export declare function tap(point: Point, options?: TapOptions): Promise<void>;
+/** Answers the point, and with `verify` or `observe` the effect and its detail. */
+export declare function tap(
+  point: Point,
+  options?: TapOptions,
+): Promise<TapResult>;
+/** Answers an empty object, or with `observe` what the scroll settled on. */
 export declare function swipe(
   from: Point,
   to: Point,
-  options?: CallOptions & { durationMs?: number },
-): Promise<void>;
+  options?: CallOptions & ObserveOptions & { durationMs?: number },
+): Promise<Observation>;
 export declare function drag(
   from: Point,
   to: Point,
-  options?: CallOptions & { durationMs?: number; pressMs?: number },
-): Promise<void>;
+  options?: CallOptions &
+    ObserveOptions & { durationMs?: number; pressMs?: number },
+): Promise<Observation>;
 export declare function pinch(
   center: Point,
   scale: number,
