@@ -270,6 +270,19 @@ func (r *lockStateReader) locked(ctx context.Context, device *coredevice.Device)
 	return state.PasscodeRequired, nil
 }
 
+func (r *lockStateReader) language(ctx context.Context, device *coredevice.Device) (language string, err error) {
+	if err = ctx.Err(); err != nil {
+		return "", err
+	}
+	r.access.Lock()
+	defer r.access.Unlock()
+	err = r.useLocked(ctx, device, func(conn *coredevice.LockStateConn) (err error) {
+		language, err = conn.Language(ctx)
+		return
+	})
+	return language, err
+}
+
 // useLocked runs read on the kept lockdown connection, connecting again when
 // one kept from an earlier read fails.
 func (r *lockStateReader) useLocked(ctx context.Context, device *coredevice.Device, read func(conn *coredevice.LockStateConn) error) error {
