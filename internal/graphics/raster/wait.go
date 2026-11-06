@@ -279,6 +279,8 @@ func callWaitForChange(c *call) (any, error) {
 		return nil, err
 	}
 	check := reference != frame
+	started := time.Now()
+	looked, compared := 0, 0
 	for {
 		if !check {
 			next, err := feed.Next(c.ctx, deadline)
@@ -290,16 +292,22 @@ func callWaitForChange(c *call) (any, error) {
 				return nil, failure(NameTimeout, "the screen did not change within ", truncated(c.arguments.timeout()), " ms")
 			}
 			frame = next
+			looked++
 			if repeated(feed) {
 				continue
 			}
 		}
 		check = false
+		compared++
 		if err = comparison.fill(c.ctx, frame, current); err != nil {
 			frame.Release()
 			return nil, err
 		}
 		if comparison.changed(before, current) {
+			if c.env.Tracing() {
+				c.env.Trace(started, "screen.waitForChange", "compared "+truncated(float64(compared))+" of "+truncated(float64(looked))+
+					" frames; answered "+truncated(nowMilliseconds()-frameTime(frame))+" ms after the changed frame arrived", time.Since(started))
+			}
 			return c.keep(frame), nil
 		}
 	}
@@ -346,7 +354,7 @@ func callWaitForStable(c *call) (any, error) {
 	copyLevels(previous, anchor)
 	started := time.Now()
 	changedAt, last := nowMilliseconds(), frameTime(frame)
-	frames, changes, compared := 0, 0, 1
+	frames, changes, compared, looked := 0, 0, 1, 0
 	// needed is the quiet time, which small changes in frame after frame lengthen; moving
 	// counts those frames.
 	needed, moving := quiet, 0
@@ -360,7 +368,7 @@ func callWaitForStable(c *call) (any, error) {
 			answered = true
 		}
 		if answered && frames >= stableFrames && last-changedAt >= needed {
-			c.traceStable(started, frames, changes, compared, last-changedAt)
+			c.traceStable(started, frames, changes, compared, looked, last-changedAt)
 			return c.keep(frame), nil
 		}
 		if !time.Now().Before(deadline) {
@@ -378,7 +386,7 @@ func callWaitForStable(c *call) (any, error) {
 		}
 		if next == nil {
 			if answered && nowMilliseconds()-changedAt >= quiet+stableSilence {
-				c.traceStable(started, frames, changes, compared, nowMilliseconds()-changedAt)
+				c.traceStable(started, frames, changes, compared, looked, nowMilliseconds()-changedAt)
 				return c.keep(frame), nil
 			}
 			continue
@@ -386,6 +394,7 @@ func callWaitForStable(c *call) (any, error) {
 		frame.Release()
 		frame = next
 		last = frameTime(frame)
+		looked++
 		if repeated(feed) {
 			frames++
 			moving = 0
@@ -420,12 +429,12 @@ func callWaitForStable(c *call) (any, error) {
 	}
 }
 
-func (c *call) traceStable(started time.Time, frames, changes, compared int, quiet float64) {
+func (c *call) traceStable(started time.Time, frames, changes, compared, looked int, quiet float64) {
 	if !c.env.Tracing() {
 		return
 	}
-	c.env.Trace(started, "screen.waitForStable", truncated(float64(changes))+" changes; compared "+truncated(float64(compared))+" frames; settled after "+
-		truncated(quiet)+" ms and "+truncated(float64(frames))+" quiet frames", time.Since(started))
+	c.env.Trace(started, "screen.waitForStable", truncated(float64(changes))+" changes; compared "+truncated(float64(compared))+" of "+truncated(float64(looked+1))+
+		" frames; settled "+truncated(quiet)+" ms after the last change, over "+truncated(float64(frames))+" quiet frames", time.Since(started))
 }
 
 func earlier(a, b time.Time) time.Time {
