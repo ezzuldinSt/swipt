@@ -56,6 +56,7 @@ type axSession struct {
 	target    Aim
 	settled   time.Time
 	animating bool
+	moved     bool
 	stale     bool
 	reread    SnapshotOptions
 	fixed     bool

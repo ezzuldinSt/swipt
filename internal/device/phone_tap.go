@@ -34,6 +34,11 @@ type Aim struct {
 	// Selected tells that the element was selected as the tap went, so the tap
 	// may rightly change nothing.
 	Selected bool
+	// Doubt tells why the tap's point may have missed the element: part of
+	// it was cut off, a cover or bar lay by it, it moved or animated before
+	// the tap, or the hit test answered another element that it accepted. It
+	// is "" for an element shown whole, clear and steady.
+	Doubt string
 
 	mark Mark
 }
@@ -134,7 +139,7 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 		return s.target, E.Extend(cause, pending, after)
 	}
 	var delay time.Duration
-	var waited string
+	var waited, unsteady string
 	var covered time.Time
 	for attempt := 1; ; attempt++ {
 		var pending string
@@ -164,6 +169,9 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 			break
 		}
 		waited = pending
+		if s.animating || s.moved || s.blocker != nil {
+			unsteady = pending
+		}
 		alerts = append(alerts, alerted(pushes)...)
 		delay = min(max(delay*2, pollFirst), pollLongest)
 		if s.animating {
@@ -196,14 +204,17 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 		c.events.publish(Event{Kind: EventInput})
 		c.front.acted()
 		s.target.mark.conn, s.target.mark.screens = c, c.events.screen.Load()
+		if s.target.Doubt == "" && unsteady != "" {
+			s.target.Doubt = "before the tap, " + unsteady
+		}
 	}
 	return s.target, err
 }
 
 func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, error) {
 	name := describeElement(target.AX)
-	s.target = Aim{Element: name, Point: target.Point, Secure: target.AX.Secure(), Visible: target.Visible, Risky: riskyWord(target.AX)}
-	s.animating, s.stale, s.fixed, s.blocker = false, false, false, nil
+	s.target = Aim{Element: name, Point: target.Point, Secure: target.AX.Secure(), Visible: target.Visible, Risky: riskyWord(target.AX), Doubt: target.doubt()}
+	s.animating, s.moved, s.stale, s.fixed, s.blocker = false, false, false, false, nil
 	s.reread = SnapshotOptions{Depth: target.model.read.Depth, Within: target.model.read.Within}
 	if !target.HasFrame() {
 		return Point{}, "", E.New(name, " has no position on the screen; perform one of its actions instead")
@@ -246,6 +257,7 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 	case !attributes.Value.Enabled:
 		return Point{}, name + " is disabled", nil
 	case previous != nil && !nearFrame(attributes.Value.Frame, previous):
+		s.moved = true
 		return Point{}, name + " is moving", nil
 	}
 	if fresh := attributes.Value; fresh.Label != "" || fresh.Identifier != "" || fresh.Value != "" {
@@ -269,6 +281,7 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 		}
 		if !rect.Empty() && !rect.Contains(at) {
 			at = shown.Center()
+			s.target.Doubt = "it moved since the screen was read"
 			again := &accessibility.Batch{}
 			hit = again.HitTest(s.geometry.digitizer(at))
 			if err := s.client.Run(ctx, again); err != nil {
@@ -282,7 +295,10 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 	var reached accessibility.Element
 	node := target.model.Node(hit.Value.Ref)
 	switch {
-	case hit.Value.Ref == target.AX.Ref, node != nil && (target.Contains(node) || node.AX.AccessibilityElement && node.Contains(target)):
+	case hit.Value.Ref == target.AX.Ref, node != nil && target.Contains(node):
+		return at, "", nil
+	case node != nil && node.AX.AccessibilityElement && node.Contains(target):
+		s.target.Doubt = "the hit test answered " + describeElement(node.AX) + ", which holds it"
 		return at, "", nil
 	case node != nil:
 		reached = node.AX
@@ -300,6 +316,7 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 			return Point{}, "", err
 		}
 		if !known && target.model.read.Within == "" && element.Code == 0 && sameWindow(target, element.Value) {
+			s.target.Doubt = "the hit test answered " + describeElement(element.Value) + ", which the read did not list"
 			return at, "", nil
 		}
 		reached = element.Value

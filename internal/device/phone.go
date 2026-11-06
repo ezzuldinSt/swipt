@@ -314,6 +314,8 @@ type PhoneNode struct {
 	scroll, win *PhoneNode
 	cover       *PhoneNode
 	shown       float64
+	// overlapped tells that a cover lies over or right by the activation point.
+	overlapped bool
 }
 
 func (n *PhoneNode) HasFrame() bool {

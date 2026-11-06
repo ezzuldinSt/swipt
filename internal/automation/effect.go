@@ -168,11 +168,13 @@ func pointTarget(at device.Point) device.Rect {
 
 // tapElement taps the element, scrolling it into view first when it is off
 // the screen or under the application's bars, and tells what the tap changed.
-// When nothing changed it tries again, in turn: at a safer point of the
-// element, after scrolling it clear of the bars, and with its press action;
-// it never tries again on an element whose label makes acting on it
-// irreversible or outward.
-func (o *operation) tapElement(ctx context.Context, phone *device.Phone, ref string, timeout time.Duration) (any, error) {
+// When nothing changed and the tap's point was in doubt (Aim.Doubt), it tries
+// again, in turn: at a safer point of the element, after scrolling it clear
+// of the bars, and with its press action. It never tries again on a clear,
+// whole and steady element, whose tap may rightly show nothing or show it
+// only after the window, nor on an element whose label makes acting on it
+// irreversible or outward, nor when recover is false.
+func (o *operation) tapElement(ctx context.Context, phone *device.Phone, ref string, timeout time.Duration, recover bool) (any, error) {
 	s := o.observe(ctx, phone)
 	defer s.close()
 	result := tapResult{}
@@ -180,12 +182,14 @@ func (o *operation) tapElement(ctx context.Context, phone *device.Phone, ref str
 		result.Attempts = append(result.Attempts, tapAttempt{Method: method, Point: pointOf(aim.Point), Effect: outcome.Where, Detail: outcome.Detail})
 		result.Effect, result.Detail = outcome.Where, outcome.Detail
 	}
+	var scrolledFirst bool
 	if placement, err := phone.Placement(ctx, ref); err == nil && placement.Scrolls && (!placement.Shown || placement.Covered) {
 		scrolled, err := phone.ScrollIntoView(ctx, ref)
 		detail := scrolled.Detail
 		if err != nil {
 			detail = Message(err)
 		}
+		scrolledFirst = scrolled.Moved
 		result.Attempts = append(result.Attempts, tapAttempt{Method: "scroll", Detail: detail})
 	}
 	aim, err := phone.TapElement(ctx, ref, device.TapOptions{Timeout: timeout, Ready: s.ready})
@@ -193,18 +197,28 @@ func (o *operation) tapElement(ctx context.Context, phone *device.Phone, ref str
 	if err != nil {
 		return nil, err
 	}
+	doubt := aim.Doubt
+	if doubt == "" && scrolledFirst {
+		doubt = "it was scrolled into view first"
+	}
 	result.Element, result.Point = aim.Element, pointOf(aim.Point)
 	add("tap", aim, s.effect(ctx, aim.Mark(), aim.Visible))
 	switch {
 	case result.Effect != effectNone:
 		return compact(result), nil
+	case !recover:
+		return compact(result), nil
 	case aim.Risky != "":
 		result.Detail += "; not tried again, as " + strconv.Quote(aim.Risky) + " may act irreversibly or outside the device"
 		return compact(result), nil
 	case aim.Selected:
-		result.Detail += "; it was already selected"
+		result.Detail += "; not tried again, as it was already selected"
+		return compact(result), nil
+	case doubt == "":
+		result.Detail += "; not tried again, as it was shown whole, clear of bars and covers and steady, and a tap that rightly changes nothing, or shows it later, looks the same"
 		return compact(result), nil
 	}
+	result.Attempts[len(result.Attempts)-1].Detail += "; tried again, as " + doubt
 	first := aim.Point
 	retried, err := phone.TapElement(ctx, ref, device.TapOptions{Timeout: retryLimit, Retry: &first, Ready: s.ready})
 	switch {

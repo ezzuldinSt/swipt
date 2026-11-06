@@ -96,6 +96,25 @@ func (n *PhoneNode) saferPoint() Point {
 	return at
 }
 
+// doubt tells why a tap at the element's point may not reach it, as the read
+// shows it: part of it is cut off, a cover lies over or by its point, or a bar
+// lies within barReach of it, where the bar's container may take the touch.
+// It is "" for an element shown whole and clear of covers and bars.
+func (n *PhoneNode) doubt() string {
+	switch {
+	case !n.Shown():
+		return "it was off the screen"
+	case n.Visible.area() < n.Frame.area()-1:
+		return "part of it lies outside its scroll view or the screen"
+	case n.Covered || n.overlapped:
+		return "another element lies over or by its point"
+	}
+	if above, below := n.barsNear(); above || below {
+		return "it lies within " + strconv.Itoa(int(barReach)) + " pt of the application's bars"
+	}
+	return ""
+}
+
 // clearArea is the part of the element's scroll view where an element lies
 // scrollClearance clear of the bars above and below it, or scrollMargin
 // clear of them when that leaves no room for the element.

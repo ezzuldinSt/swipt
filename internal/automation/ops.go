@@ -698,7 +698,8 @@ func uiTap(ctx context.Context, phone *device.Phone, call *operation) (any, erro
 	var ref string
 	var timeoutMs *float64
 	options := struct {
-		Verify *bool `json:"verify"`
+		Verify  *bool `json:"verify"`
+		Recover *bool `json:"recover"`
 	}{}
 	if err := call.decode(1, &ref, &timeoutMs, &strict{&options}); err != nil {
 		return nil, err
@@ -708,7 +709,7 @@ func uiTap(ctx context.Context, phone *device.Phone, call *operation) (any, erro
 		return nil, err
 	}
 	if options.Verify == nil || *options.Verify {
-		return call.tapElement(ctx, phone, ref, timeout)
+		return call.tapElement(ctx, phone, ref, timeout, options.Recover == nil || *options.Recover)
 	}
 	aim, err := phone.Tap(ctx, ref, timeout)
 	call.record(aim, call.args[1:]...)
