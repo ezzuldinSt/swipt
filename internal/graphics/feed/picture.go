@@ -540,47 +540,6 @@ func (p *picture) quarterGray(width, height, turns int) *image.Gray {
 	return turnedGray(plane, turns)
 }
 
-// quarterOfImage shrinks upright pixels to a quarter of their size by averaging blocks, in gray.
-func quarterOfImage(source image.Image) *image.Gray {
-	bounds := source.Bounds()
-	width, height := bounds.Dx(), bounds.Dy()
-	outWidth, outHeight := max(width/4, 1), max(height/4, 1)
-	plane := image.NewGray(image.Rect(0, 0, outWidth, outHeight))
-	pixels, isColor := source.(*image.NRGBA)
-	gray, isGray := source.(*image.Gray)
-	parallel(outHeight, func(start, end int) {
-		for qy := start; qy < end; qy++ {
-			top, bottom := qy*height/outHeight, (qy+1)*height/outHeight
-			for qx := range outWidth {
-				left, right := qx*width/outWidth, (qx+1)*width/outWidth
-				var red, green, blue, count int32
-				for y := top; y < bottom; y++ {
-					for x := left; x < right; x++ {
-						switch {
-						case isColor:
-							at := pixels.PixOffset(bounds.Min.X+x, bounds.Min.Y+y)
-							red += int32(pixels.Pix[at])
-							green += int32(pixels.Pix[at+1])
-							blue += int32(pixels.Pix[at+2])
-						case isGray:
-							value := int32(gray.Pix[gray.PixOffset(bounds.Min.X+x, bounds.Min.Y+y)])
-							red, green, blue = red+value, green+value, blue+value
-						default:
-							r, g, b, _ := source.At(bounds.Min.X+x, bounds.Min.Y+y).RGBA()
-							red, green, blue = red+int32(r>>8), green+int32(g>>8), blue+int32(b>>8)
-						}
-						count++
-					}
-				}
-				if count > 0 {
-					plane.Pix[qy*plane.Stride+qx] = grayOf((red+count/2)/count, (green+count/2)/count, (blue+count/2)/count)
-				}
-			}
-		}
-	})
-	return plane
-}
-
 // turnedGray turns a gray plane clockwise by quarter turns.
 func turnedGray(plane *image.Gray, turns int) *image.Gray {
 	turns &= 3
