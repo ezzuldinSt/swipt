@@ -475,7 +475,7 @@ func (p *Phone) Button(ctx context.Context, name string) error {
 	var check func(ctx context.Context, c *conn) error
 	if name == "home" {
 		check = func(ctx context.Context, c *conn) error {
-			_, err := c.front.waitFor(ctx, springboardBundleID, time.Now().Add(launchLimit))
+			_, err := c.front.waitFor(ctx, springboardBundleID, 0, time.Now().Add(launchLimit))
 			return err
 		}
 	}
@@ -504,6 +504,7 @@ func (p *Phone) Button(ctx context.Context, name string) error {
 
 func (p *Phone) Launch(ctx context.Context, bundleID, url string, restart, animated bool) error {
 	var started time.Time
+	var pid uint64
 	return p.act(ctx, action{
 		name:     "launch " + bundleID,
 		unlocked: true,
@@ -511,7 +512,8 @@ func (p *Phone) Launch(ctx context.Context, bundleID, url string, restart, anima
 			started = time.Now()
 			launchContext, cancel := context.WithDeadline(ctx, started.Add(launchLimit))
 			defer cancel()
-			_, err := apps.Launch(launchContext, c.device, bundleID, url, restart, animated)
+			var err error
+			pid, err = apps.Launch(launchContext, c.device, bundleID, url, restart, animated)
 			if err == nil {
 				return nil
 			}
@@ -522,7 +524,7 @@ func (p *Phone) Launch(ctx context.Context, bundleID, url string, restart, anima
 			return E.Append(err, listErr, func(err error) error { return E.Cause(err, "list the apps") })
 		},
 		check: func(ctx context.Context, c *conn) error {
-			front, err := c.front.waitFor(ctx, bundleID, started.Add(launchLimit))
+			front, err := c.front.waitFor(ctx, bundleID, pid, started.Add(launchLimit))
 			if err != nil {
 				return err
 			}

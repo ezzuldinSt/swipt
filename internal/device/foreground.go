@@ -25,9 +25,14 @@ const (
 	frontProbe       = 3 * time.Second
 )
 
-// Tracking, once started, lasts as long as the connection, and a lost app
-// state connection is made again.
+// While waiting for an app to come to the front or leave it, the process
+// state is read every processPoll on the kept instruments connection, which
+// answers in a round trip while the accessibility service may take seconds
+// during the transition. Tracking, once started, lasts as long as the
+// connection, and a lost app state connection is made again.
 const (
+	processPoll           = 40 * time.Millisecond
+	processProbeLimit     = 2 * time.Second
 	appStatesRetryFirst   = time.Second
 	appStatesRetryLongest = 30 * time.Second
 )
@@ -80,7 +85,8 @@ type foreground struct {
 	infoAccess sync.Mutex
 	info       *instruments.DeviceInfo
 
-	tracker func(ctx context.Context, stopped chan struct{})
+	processes func(ctx context.Context, pids []uint64) ([]uint64, error)
+	tracker   func(ctx context.Context, stopped chan struct{})
 }
 
 func newForeground(c *conn) *foreground {
@@ -88,7 +94,7 @@ func newForeground(c *conn) *foreground {
 		conn: c, listeners: make(map[int]func(ForegroundApp)), kick: make(chan struct{}, 1), paths: make(map[uint64]string),
 		probes: make(map[uint64]time.Time),
 	}
-	f.tracker = f.track
+	f.processes, f.tracker = f.foregroundProcesses, f.track
 	return f
 }
 
@@ -149,21 +155,31 @@ func (f *foreground) read(ctx context.Context) (frontApplication, error) {
 // 1.8 s after the device ran a launched one in front, and the device kept
 // running the previous app in front for at least 700 ms of that (iPhone18,2,
 // iOS 27.2 24B119).
+//
+// SpringBoard reported in front once the app before it left is contradicted
+// by the same lag: an app named then must also be running in front.
 func (f *foreground) contradicted(ctx context.Context, front frontApplication) bool {
 	f.access.Lock()
 	current := f.current
 	f.access.Unlock()
-	if !front.app() || !current.app() || front.pid == current.pid {
+	if !front.app() || front.pid == current.pid {
 		return false
 	}
-	shown, err := f.foregroundProcesses(ctx, []uint64{front.pid, current.pid})
+	pids := []uint64{front.pid, current.pid}
+	switch {
+	case current.via == viaLeft:
+		pids = pids[:1]
+	case !current.app():
+		return false
+	}
+	shown, err := f.processes(ctx, pids)
 	if err != nil {
 		f.conn.connection.trace(front.at, "stale.unknown", front.bundleID+" pid "+strconv.FormatUint(front.pid, 10)+": "+err.Error(), time.Since(front.at))
 		return false
 	}
 	reason := ""
 	switch {
-	case slices.Contains(shown, current.pid):
+	case current.app() && slices.Contains(shown, current.pid):
 		reason = current.bundleID + " is still in front"
 	case !slices.Contains(shown, front.pid):
 		reason = "it is not in front"
@@ -196,7 +212,7 @@ func (f *foreground) beneath(ctx context.Context, springboard frontApplication) 
 	if len(pids) == 0 {
 		return springboard
 	}
-	shown, err := f.foregroundProcesses(ctx, pids)
+	shown, err := f.processes(ctx, pids)
 	if err != nil {
 		if ctx.Err() == nil {
 			f.conn.logger.Debug(E.Cause(err, "read the foreground state of processes"))
@@ -272,18 +288,18 @@ func (f *foreground) probeFront(ctx context.Context, pid uint64, bundleID string
 			return
 		}
 		asked := time.Now()
-		shown, err := f.foregroundProcesses(ctx, []uint64{pid})
+		shown, err := f.processInFront(ctx, pid)
 		if err != nil {
 			if ctx.Err() == nil {
 				f.conn.logger.Debug(E.Cause(err, "read the foreground state of process ", pid))
 			}
 			return
 		}
-		if len(shown) > 0 {
+		if shown {
 			f.saw(frontApplication{pid: pid, bundleID: bundleID, at: asked, via: "instruments"})
 			return
 		}
-		if sleep(ctx, pollFirst) != nil {
+		if sleep(ctx, processPoll-time.Since(asked)) != nil {
 			return
 		}
 	}
@@ -381,6 +397,14 @@ func (f *foreground) acted() {
 	if watched {
 		f.trigger(frontBurst)
 	}
+}
+
+// settle ends the reads an action or a wait asked for, once its outcome is
+// known.
+func (f *foreground) settle() {
+	f.access.Lock()
+	f.until = time.Now()
+	f.access.Unlock()
 }
 
 func (f *foreground) pushed(push accessibility.Push) {
@@ -597,7 +621,12 @@ func (f *foreground) launched(state instruments.AppState) {
 	}
 }
 
-func (f *foreground) waitFor(ctx context.Context, bundleID string, deadline time.Time) (string, error) {
+// waitFor waits until the app with bundleID is in front, seen after the last
+// action, or the deadline passes, and answers the app in front. The tracking
+// keeps reading the frontmost application meanwhile; when the app's process is
+// known, or the wait is for SpringBoard and an app was in front, its process
+// state is followed as well.
+func (f *foreground) waitFor(ctx context.Context, bundleID string, pid uint64, deadline time.Time) (string, error) {
 	changed := make(chan struct{}, 1)
 	cancel := f.watch(func(ForegroundApp) {
 		select {
@@ -606,23 +635,113 @@ func (f *foreground) waitFor(ctx context.Context, bundleID string, deadline time
 		}
 	})
 	defer cancel()
+	waiting, stop := context.WithDeadline(ctx, deadline)
+	defer stop()
+	f.access.Lock()
+	from, acted := f.current, f.actedAt
+	f.access.Unlock()
 	f.trigger(time.Until(deadline))
+	switch {
+	case pid != 0:
+		go f.followArrival(waiting, pid, bundleID)
+	case bundleID == springboardBundleID && from.app():
+		go f.followLeave(waiting, from)
+	}
+	// Seeing the same app again tells no listener, so the wait also looks
+	// every processPoll.
+	look := time.NewTicker(processPoll)
+	defer look.Stop()
 	for {
-		front, err := f.get(ctx)
-		if err != nil || front.bundleID == bundleID {
-			return front.bundleID, err
+		f.access.Lock()
+		current := f.current
+		f.access.Unlock()
+		if current.bundleID == bundleID && !current.at.Before(acted) {
+			f.settle()
+			return bundleID, nil
 		}
-		timer := time.NewTimer(time.Until(deadline))
 		select {
 		case <-changed:
-		case <-timer.C:
-			return front.bundleID, nil
-		case <-ctx.Done():
-			timer.Stop()
-			return front.bundleID, ctx.Err()
+		case <-look.C:
+		case <-waiting.Done():
+			return current.bundleID, ctx.Err()
 		}
-		timer.Stop()
 	}
+}
+
+// SpringBoard came to the front as the app before it left, which its process
+// state told. The followers report what they find as seen when the answer
+// comes, so that the accessibility service, which names the previous app for a
+// while after a switch, does not undo it with a read started earlier.
+const viaLeft = "left"
+
+// followArrival reads whether a launched process runs in front until it does.
+func (f *foreground) followArrival(ctx context.Context, pid uint64, bundleID string) {
+	for {
+		asked := time.Now()
+		shown, err := f.processInFront(ctx, pid)
+		switch {
+		case err != nil:
+			if ctx.Err() == nil {
+				f.conn.logger.Debug(E.Cause(err, "read the foreground state of process ", pid))
+			}
+			return
+		case shown:
+			f.saw(frontApplication{pid: pid, bundleID: bundleID, at: time.Now(), via: "instruments"})
+			return
+		}
+		if sleep(ctx, processPoll-time.Since(asked)) != nil {
+			return
+		}
+	}
+}
+
+// followLeave reads whether an app is still running in front until it is not,
+// as it is on going to the home screen, and then reports SpringBoard in front.
+// It gives up when the app was not running in front to begin with.
+func (f *foreground) followLeave(ctx context.Context, from frontApplication) {
+	seen := false
+	for {
+		asked := time.Now()
+		shown, err := f.processInFront(ctx, from.pid)
+		answered := time.Now()
+		switch {
+		case err != nil:
+			if ctx.Err() == nil {
+				f.conn.logger.Debug(E.Cause(err, "read the foreground state of process ", from.pid))
+			}
+			return
+		case shown:
+			seen = true
+		case !seen:
+			return
+		default:
+			springboard, err := f.conn.springboardPID(ctx)
+			if err != nil {
+				return
+			}
+			f.saw(frontApplication{pid: springboard, bundleID: springboardBundleID, at: answered, via: viaLeft})
+			return
+		}
+		if sleep(ctx, processPoll-time.Since(asked)) != nil {
+			return
+		}
+	}
+}
+
+// processInFront reads whether a process runs in front on the kept
+// instruments connection. The read is bound to the connection rather than to
+// ctx, as canceling it would end that connection.
+func (f *foreground) processInFront(ctx context.Context, pid uint64) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	probe, cancel := context.WithTimeout(f.conn.ctx, processProbeLimit)
+	defer cancel()
+	shown, err := f.processes(probe, []uint64{pid})
+	if err == nil {
+		err = ctx.Err()
+	}
+	return len(shown) > 0, err
 }
 
 func (f *foreground) close() {
