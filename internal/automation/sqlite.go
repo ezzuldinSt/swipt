@@ -1,136 +1,6 @@
-//go:build darwin && cgo
-
 package automation
 
-/*
-#cgo LDFLAGS: -lsqlite3
-
-#include <sqlite3.h>
-#include <stdlib.h>
-#include <string.h>
-
-typedef struct {
-	char *schema;
-	char *table;
-	sqlite3_int64 row;
-} swipt_change;
-
-typedef struct {
-	swipt_change *items;
-	size_t count;
-	size_t capacity;
-} swipt_changes;
-
-static void swipt_record_change(void *context, int operation, const char *schema, const char *table, sqlite3_int64 row) {
-	swipt_changes *changes = context;
-	if (changes->count == changes->capacity) {
-		size_t capacity = changes->capacity == 0 ? 16 : changes->capacity * 2;
-		swipt_change *items = realloc(changes->items, capacity * sizeof(swipt_change));
-		if (items == NULL) {
-			return;
-		}
-		changes->items = items;
-		changes->capacity = capacity;
-	}
-	changes->items[changes->count++] = (swipt_change){strdup(schema), strdup(table), row};
-}
-
-static void swipt_clear_changes(void *context) {
-	swipt_changes *changes = context;
-	for (size_t index = 0; index < changes->count; index++) {
-		free(changes->items[index].schema);
-		free(changes->items[index].table);
-	}
-	changes->count = 0;
-}
-
-static void swipt_watch_changes(sqlite3 *db, swipt_changes *changes) {
-	sqlite3_update_hook(db, swipt_record_change, changes);
-	sqlite3_rollback_hook(db, swipt_clear_changes, changes);
-}
-
-static void swipt_free_changes(swipt_changes *changes) {
-	swipt_clear_changes(changes);
-	free(changes->items);
-	free(changes);
-}
-
-static int swipt_interrupted(sqlite3 *db) {
-	if (__builtin_available(iOS 17.2, macOS 14.2, *)) {
-		return sqlite3_is_interrupted(db);
-	}
-	return 0;
-}
-
-static int swipt_wait(void *context, int count) {
-	static const int delays[] = {1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100};
-	static const int steps = sizeof(delays) / sizeof(delays[0]);
-	int waited = 0;
-	for (int index = 0; index < count; index++) {
-		waited += delays[index < steps ? index : steps - 1];
-	}
-	if (waited >= 5000 || swipt_interrupted(context)) {
-		return 0;
-	}
-	sqlite3_sleep(delays[count < steps ? count : steps - 1]);
-	return !swipt_interrupted(context);
-}
-
-static void swipt_set_wait(sqlite3 *db) {
-	sqlite3_busy_handler(db, swipt_wait, db);
-}
-
-static int swipt_bind_text(sqlite3_stmt *statement, int index, const char *text, int length) {
-	return sqlite3_bind_text(statement, index, length == 0 ? "" : text, length, SQLITE_TRANSIENT);
-}
-
-static int swipt_deserialize(sqlite3 *db, const void *data, sqlite3_int64 size) {
-	unsigned char *buffer = sqlite3_malloc64(size);
-	if (buffer == NULL) {
-		return SQLITE_NOMEM;
-	}
-	memcpy(buffer, data, size);
-	return sqlite3_deserialize(db, "main", buffer, size, size, SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE);
-}
-
-static int swipt_inside(const char *directory, const char *file) {
-	size_t length = strlen(directory);
-	if (strncmp(file, directory, length) != 0 || file[length] != '/') {
-		return 0;
-	}
-	for (const char *segment = file + length; *segment != '\0';) {
-		segment++;
-		size_t size = strcspn(segment, "/");
-		if ((size == 1 && segment[0] == '.') || (size == 2 && segment[0] == '.' && segment[1] == '.')) {
-			return 0;
-		}
-		segment += size;
-	}
-	return 1;
-}
-
-static int swipt_authorize(void *directory, int action, const char *file, const char *unused, const char *schema, const char *trigger) {
-	if (action != SQLITE_ATTACH || (file != NULL && (file[0] == '\0' || strcmp(file, ":memory:") == 0))) {
-		return SQLITE_OK;
-	}
-	return file != NULL && sqlite3_strnicmp(file, "file:", 5) != 0 && swipt_inside(directory, file) ? SQLITE_OK : SQLITE_DENY;
-}
-
-static void swipt_confine(sqlite3 *db, const char *directory) {
-	sqlite3_set_authorizer(db, swipt_authorize, (void *)directory);
-}
-
-static int swipt_bind_blob(sqlite3_stmt *statement, int index, const void *data, int length) {
-	if (length == 0) {
-		return sqlite3_bind_zeroblob(statement, index, 0);
-	}
-	return sqlite3_bind_blob(statement, index, data, length, SQLITE_TRANSIENT);
-}
-*/
-import "C"
-
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -146,10 +16,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 
 	E "github.com/sagernet/sing/common/exceptions"
 )
+
+// The SQLite calls live in sqlite_darwin.go (the system libsqlite3 through cgo)
+// and sqlite_other.go (modernc.org/sqlite), behind sqliteConn and sqliteStmt.
 
 type DatabaseChange struct {
 	Swiplet  string
@@ -180,11 +52,9 @@ type database struct {
 	path       string
 	file       string
 	watch      bool
-	conn       *C.sqlite3
-	confined   *C.char
-	changes    *C.swipt_changes
+	conn       *sqliteConn
 	next       int
-	statements map[int]*C.sqlite3_stmt
+	statements map[int]sqliteStmt
 }
 
 type databaseRequest struct {
@@ -238,6 +108,7 @@ const (
 
 var (
 	errDatabaseClosed = E.Cause1(ErrInvalid, E.New("the database is closed"))
+	errNoStatement    = E.Cause1(ErrInvalid, E.New("the SQL has no statement"))
 	memorySequence    atomic.Uint64
 )
 
@@ -273,7 +144,7 @@ func (h *Host) SQLite(client any, swiplet string, request []byte) (any, error) {
 		if !found || db.client != client || db.swiplet != swiplet {
 			return nil, errDatabaseClosed
 		}
-		C.sqlite3_interrupt(db.conn)
+		db.conn.interrupt()
 		return nil, nil
 	}
 	db, err := h.database(client, swiplet, call.Handle, call.Op == "close")
@@ -411,32 +282,21 @@ func memoryFile() string {
 }
 
 func openConnection(client any, swiplet, directory, path, file string, watch bool) (*database, error) {
-	flags := C.int(C.SQLITE_OPEN_READWRITE | C.SQLITE_OPEN_CREATE | C.SQLITE_OPEN_NOMUTEX)
-	if path == memoryDatabase {
-		flags |= C.SQLITE_OPEN_URI
-	}
-	name := C.CString(file)
-	defer C.free(unsafe.Pointer(name))
-	var conn *C.sqlite3
-	code := C.sqlite3_open_v2(name, &conn, flags, nil)
-	db := &database{client: client, swiplet: swiplet, directory: directory, path: path, file: file, watch: watch, conn: conn, statements: make(map[int]*C.sqlite3_stmt)}
-	if code != C.SQLITE_OK {
-		err := sqliteFailure(conn, code)
-		db.close()
+	conn, err := openSQLite(file, path == memoryDatabase)
+	if err != nil {
 		return nil, err
 	}
-	db.confined = C.CString(directory)
-	C.swipt_confine(conn, db.confined)
-	C.swipt_set_wait(conn)
+	db := &database{client: client, swiplet: swiplet, directory: directory, path: path, file: file, watch: watch, conn: conn, statements: make(map[int]sqliteStmt)}
+	conn.confine(directory)
+	conn.setWait()
 	if path != memoryDatabase {
-		if err := db.exec("PRAGMA journal_mode = WAL"); err != nil {
+		if err = conn.exec("PRAGMA journal_mode = WAL"); err != nil {
 			db.close()
 			return nil, err
 		}
 	}
 	if watch {
-		db.changes = (*C.swipt_changes)(C.calloc(1, C.sizeof_swipt_changes))
-		C.swipt_watch_changes(conn, db.changes)
+		conn.watchChanges()
 	}
 	return db, nil
 }
@@ -451,16 +311,13 @@ func (h *Host) register(db *database) any {
 }
 
 func (db *database) restore(data []byte) error {
-	name := C.CString(memoryDatabase)
-	defer C.free(unsafe.Pointer(name))
-	var scratch *C.sqlite3
-	code := C.sqlite3_open_v2(name, &scratch, C.SQLITE_OPEN_READWRITE|C.SQLITE_OPEN_CREATE|C.SQLITE_OPEN_NOMUTEX, nil)
-	defer C.sqlite3_close_v2(scratch)
-	if code != C.SQLITE_OK {
-		return sqliteFailure(scratch, code)
+	scratch, err := openSQLite(memoryDatabase, false)
+	if err != nil {
+		return err
 	}
-	if code = C.swipt_deserialize(scratch, unsafe.Pointer(unsafe.SliceData(data)), C.sqlite3_int64(len(data))); code != C.SQLITE_OK {
-		return sqliteFailure(scratch, code)
+	defer scratch.close()
+	if err = scratch.deserialize(data); err != nil {
+		return err
 	}
 	return copyDatabase(db.conn, "main", scratch, "main")
 }
@@ -480,25 +337,6 @@ func backupDatabase(dest *database, destSchema string, source *database, sourceS
 		return errDatabaseClosed
 	}
 	return copyDatabase(dest.conn, destSchema, source.conn, sourceSchema)
-}
-
-func copyDatabase(dest *C.sqlite3, destSchema string, source *C.sqlite3, sourceSchema string) error {
-	destName := C.CString(destSchema)
-	defer C.free(unsafe.Pointer(destName))
-	sourceName := C.CString(sourceSchema)
-	defer C.free(unsafe.Pointer(sourceName))
-	backup := C.sqlite3_backup_init(dest, destName, source, sourceName)
-	if backup == nil {
-		return sqliteFailure(dest, C.sqlite3_errcode(dest))
-	}
-	code := C.sqlite3_backup_step(backup, -1)
-	if finished := C.sqlite3_backup_finish(backup); finished != C.SQLITE_OK {
-		return sqliteFailure(dest, finished)
-	}
-	if code != C.SQLITE_DONE {
-		return sqliteFailure(nil, code)
-	}
-	return nil
 }
 
 func (h *Host) deleteDatabase(swiplet, name string) error {
@@ -683,28 +521,15 @@ func (h *Host) publishChanges(swiplet string, changes []DatabaseChange) {
 func (db *database) close() {
 	db.access.Lock()
 	defer db.access.Unlock()
+	if db.conn == nil {
+		return
+	}
 	for _, stmt := range db.statements {
-		C.sqlite3_finalize(stmt)
+		db.conn.finalize(stmt)
 	}
 	clear(db.statements)
-	C.sqlite3_close_v2(db.conn)
+	db.conn.close()
 	db.conn = nil
-	if db.confined != nil {
-		C.free(unsafe.Pointer(db.confined))
-		db.confined = nil
-	}
-	if db.changes != nil {
-		C.swipt_free_changes(db.changes)
-		db.changes = nil
-	}
-}
-
-func sqliteFailure(conn *C.sqlite3, code C.int) error {
-	message := C.GoString(C.sqlite3_errstr(code))
-	if conn != nil && C.sqlite3_errcode(conn) != C.SQLITE_OK {
-		message = C.GoString(C.sqlite3_errmsg(conn))
-	}
-	return E.Cause1(ErrInvalid, E.New(message))
 }
 
 func (db *database) serve(call databaseRequest) (any, error) {
@@ -713,20 +538,20 @@ func (db *database) serve(call databaseRequest) (any, error) {
 	}
 	switch call.Op {
 	case "exec":
-		return nil, db.exec(call.SQL)
+		return nil, db.conn.exec(call.SQL)
 	case "prepare":
 		return db.prepare(call.SQL)
 	case "query":
-		stmt, err := db.compile(call.SQL, 0)
+		stmt, err := db.compile(call.SQL, false)
 		if err != nil {
 			return nil, err
 		}
-		defer C.sqlite3_finalize(stmt)
+		defer db.conn.finalize(stmt)
 		return db.run(stmt, call.Params, call.Count)
 	case "finalize":
 		if stmt, found := db.statements[call.Statement]; found {
 			delete(db.statements, call.Statement)
-			C.sqlite3_finalize(stmt)
+			db.conn.finalize(stmt)
 		}
 		return nil, nil
 	case "run", "step", "reset":
@@ -744,70 +569,49 @@ func (db *database) serve(call databaseRequest) (any, error) {
 			}
 			return databaseRows{Rows: rows, Done: done}, nil
 		}
-		C.sqlite3_reset(stmt)
+		db.conn.reset(stmt)
 		return nil, nil
 	case "autocommit":
-		return C.sqlite3_get_autocommit(db.conn) != 0, nil
+		return db.conn.autocommit(), nil
 	case "serialize":
-		name := C.CString(schemaName(call.Schema))
-		defer C.free(unsafe.Pointer(name))
-		var size C.sqlite3_int64
-		data := C.sqlite3_serialize(db.conn, name, &size, 0)
-		if data == nil {
+		data, ok := db.conn.serialize(schemaName(call.Schema))
+		if !ok {
 			return nil, E.Cause1(ErrInvalid, E.New("the database ", strconv.Quote(schemaName(call.Schema)), " cannot be serialized"))
 		}
-		defer C.sqlite3_free(unsafe.Pointer(data))
-		return map[string][]byte{"data": bytes.Clone(unsafe.Slice((*byte)(unsafe.Pointer(data)), int(size)))}, nil
+		return map[string][]byte{"data": data}, nil
 	}
 	return nil, E.Cause1(ErrInvalid, E.New("unknown database operation ", strconv.Quote(call.Op)))
 }
 
-func (db *database) exec(source string) error {
-	text := C.CString(source)
-	defer C.free(unsafe.Pointer(text))
-	if code := C.sqlite3_exec(db.conn, text, nil, nil, nil); code != C.SQLITE_OK {
-		return sqliteFailure(db.conn, code)
-	}
-	return nil
-}
-
-func (db *database) compile(source string, flags C.uint) (*C.sqlite3_stmt, error) {
+func (db *database) compile(source string, persistent bool) (stmt sqliteStmt, err error) {
 	if source == "" {
-		return nil, E.Cause1(ErrInvalid, E.New("the SQL has no statement"))
+		return stmt, errNoStatement
 	}
-	var stmt *C.sqlite3_stmt
-	code := C.sqlite3_prepare_v3(db.conn, (*C.char)(unsafe.Pointer(unsafe.StringData(source))), C.int(len(source)), flags, &stmt, nil)
-	if code != C.SQLITE_OK {
-		return nil, sqliteFailure(db.conn, code)
-	}
-	if stmt == nil {
-		return nil, E.Cause1(ErrInvalid, E.New("the SQL has no statement"))
-	}
-	return stmt, nil
+	return db.conn.prepare(source, persistent)
 }
 
 func (db *database) prepare(source string) (any, error) {
-	stmt, err := db.compile(source, C.SQLITE_PREPARE_PERSISTENT)
+	stmt, err := db.compile(source, true)
 	if err != nil {
 		return nil, err
 	}
 	if len(db.statements) >= statementLimit {
 		handles := slices.Sorted(maps.Keys(db.statements))
 		evicted := handles[0]
-		if index := slices.IndexFunc(handles, func(handle int) bool { return C.sqlite3_stmt_busy(db.statements[handle]) == 0 }); index >= 0 {
+		if index := slices.IndexFunc(handles, func(handle int) bool { return !db.conn.busy(db.statements[handle]) }); index >= 0 {
 			evicted = handles[index]
 		}
-		C.sqlite3_finalize(db.statements[evicted])
+		db.conn.finalize(db.statements[evicted])
 		delete(db.statements, evicted)
 	}
 	db.next++
 	db.statements[db.next] = stmt
-	return map[string]any{"statement": db.next, "columns": columnNames(stmt)}, nil
+	return map[string]any{"statement": db.next, "columns": db.columnNames(stmt)}, nil
 }
 
-func (db *database) run(stmt *C.sqlite3_stmt, params json.RawMessage, count int) (any, error) {
-	C.sqlite3_reset(stmt)
-	C.sqlite3_clear_bindings(stmt)
+func (db *database) run(stmt sqliteStmt, params json.RawMessage, count int) (any, error) {
+	db.conn.reset(stmt)
+	db.conn.clearBindings(stmt)
 	if err := db.bind(stmt, params); err != nil {
 		return nil, err
 	}
@@ -816,46 +620,46 @@ func (db *database) run(stmt *C.sqlite3_stmt, params json.RawMessage, count int)
 		return nil, err
 	}
 	return databaseRun{
-		Changes:         int64(C.sqlite3_changes64(db.conn)),
-		LastInsertRowID: int64(C.sqlite3_last_insert_rowid(db.conn)),
-		Columns:         columnNames(stmt),
+		Changes:         db.conn.changeCount(),
+		LastInsertRowID: db.conn.lastInsertRowID(),
+		Columns:         db.columnNames(stmt),
 		Rows:            rows,
 		Done:            done,
 	}, nil
 }
 
-func (db *database) read(stmt *C.sqlite3_stmt, count int) ([][]any, bool, error) {
+func (db *database) read(stmt sqliteStmt, count int) ([][]any, bool, error) {
 	rows := [][]any{}
 	size := 0
 	for count == 0 || (len(rows) < count && size < readBudget) {
-		code := C.sqlite3_step(stmt)
-		if code == C.SQLITE_DONE {
-			C.sqlite3_reset(stmt)
-			return rows, true, nil
-		}
-		if code != C.SQLITE_ROW {
-			err := sqliteFailure(db.conn, code)
-			C.sqlite3_reset(stmt)
+		found, err := db.conn.step(stmt)
+		if err != nil {
+			db.conn.reset(stmt)
 			return nil, true, err
 		}
-		row := make([]any, int(C.sqlite3_column_count(stmt)))
+		if !found {
+			db.conn.reset(stmt)
+			return rows, true, nil
+		}
+		row := make([]any, db.conn.columnCount(stmt))
 		for index := range row {
-			row[index] = columnValue(stmt, C.int(index))
-			size += int(C.sqlite3_column_bytes(stmt, C.int(index)))
+			value, bytes := db.conn.column(stmt, index)
+			row[index] = encodeColumn(value)
+			size += bytes
 		}
 		rows = append(rows, row)
 	}
 	return rows, false, nil
 }
 
-func (db *database) bind(stmt *C.sqlite3_stmt, encoded json.RawMessage) error {
+func (db *database) bind(stmt sqliteStmt, encoded json.RawMessage) error {
 	if len(encoded) == 0 || string(encoded) == "null" {
 		return nil
 	}
 	var list []json.RawMessage
 	if json.Unmarshal(encoded, &list) == nil {
 		for index, item := range list {
-			if err := db.bindValue(stmt, C.int(index+1), item); err != nil {
+			if err := db.bindValue(stmt, index+1, item); err != nil {
 				return err
 			}
 		}
@@ -866,7 +670,7 @@ func (db *database) bind(stmt *C.sqlite3_stmt, encoded json.RawMessage) error {
 		return E.Cause1(ErrInvalid, E.New("the parameters must be an array or an object"))
 	}
 	for key, item := range object {
-		index := parameterIndex(stmt, key)
+		index := db.parameterIndex(stmt, key)
 		if index == 0 {
 			continue
 		}
@@ -877,46 +681,43 @@ func (db *database) bind(stmt *C.sqlite3_stmt, encoded json.RawMessage) error {
 	return nil
 }
 
-func parameterIndex(stmt *C.sqlite3_stmt, key string) C.int {
+func (db *database) parameterIndex(stmt sqliteStmt, key string) int {
 	names := []string{key}
 	if key == "" || !strings.ContainsRune("$:@?", rune(key[0])) {
 		names = []string{"$" + key, ":" + key, "@" + key}
 	}
 	for _, name := range names {
-		text := C.CString(name)
-		index := C.sqlite3_bind_parameter_index(stmt, text)
-		C.free(unsafe.Pointer(text))
-		if index != 0 {
+		if index := db.conn.parameterIndex(stmt, name); index != 0 {
 			return index
 		}
 	}
 	return 0
 }
 
-func (db *database) bindValue(stmt *C.sqlite3_stmt, index C.int, item json.RawMessage) error {
+// bindValue binds an encoded parameter as nil, int64, float64, string or []byte.
+func (db *database) bindValue(stmt sqliteStmt, index int, item json.RawMessage) error {
 	decoder := json.NewDecoder(strings.NewReader(string(item)))
 	decoder.UseNumber()
 	var value any
 	if err := decoder.Decode(&value); err != nil {
 		return E.Cause1(ErrInvalid, E.Cause(err, "decode a parameter"))
 	}
-	var code C.int
+	var bound any
 	switch v := value.(type) {
 	case nil:
-		code = C.sqlite3_bind_null(stmt, index)
 	case bool:
-		var integer C.sqlite3_int64
+		var integer int64
 		if v {
 			integer = 1
 		}
-		code = C.sqlite3_bind_int64(stmt, index, integer)
+		bound = integer
 	case string:
-		code = C.swipt_bind_text(stmt, index, (*C.char)(unsafe.Pointer(unsafe.StringData(v))), C.int(len(v)))
+		bound = v
 	case json.Number:
 		if integer, err := v.Int64(); err == nil {
-			code = C.sqlite3_bind_int64(stmt, index, C.sqlite3_int64(integer))
+			bound = integer
 		} else if float, err := v.Float64(); err == nil {
-			code = C.sqlite3_bind_double(stmt, index, C.double(float))
+			bound = float
 		} else {
 			return E.Cause1(ErrInvalid, E.New("the number ", v.String(), " is out of range"))
 		}
@@ -926,62 +727,51 @@ func (db *database) bindValue(stmt *C.sqlite3_stmt, index C.int, item json.RawMe
 			if err != nil {
 				return E.Cause1(ErrInvalid, E.Cause(err, "decode a blob parameter"))
 			}
-			code = C.swipt_bind_blob(stmt, index, unsafe.Pointer(unsafe.SliceData(data)), C.int(len(data)))
+			bound = data
 		} else if decimal, ok := v["$i"].(string); ok && len(v) == 1 {
 			integer, err := strconv.ParseInt(decimal, 10, 64)
 			if err != nil {
 				return E.Cause1(ErrInvalid, E.New("the bigint ", decimal, " is out of the 64-bit range"))
 			}
-			code = C.sqlite3_bind_int64(stmt, index, C.sqlite3_int64(integer))
+			bound = integer
 		} else {
 			return E.Cause1(ErrInvalid, E.New("a parameter must be null, a number, a bigint, a string, a boolean or a Uint8Array"))
 		}
 	default:
 		return E.Cause1(ErrInvalid, E.New("a parameter must be null, a number, a bigint, a string, a boolean or a Uint8Array"))
 	}
-	if code != C.SQLITE_OK {
-		return sqliteFailure(db.conn, code)
-	}
-	return nil
+	return db.conn.bind(stmt, index, bound)
 }
 
 func (db *database) takeChanges() []DatabaseChange {
-	if db.changes == nil || db.changes.count == 0 || C.sqlite3_txn_state(db.conn, nil) == C.SQLITE_TXN_WRITE {
+	if db.conn == nil {
 		return nil
 	}
-	items := unsafe.Slice(db.changes.items, db.changes.count)
-	changes := make([]DatabaseChange, len(items))
-	for index, item := range items {
-		changes[index] = DatabaseChange{Swiplet: db.swiplet, Database: C.GoString(item.schema), Path: db.path, Table: C.GoString(item.table), RowID: int64(item.row)}
+	changes := db.conn.takeChanges()
+	for index := range changes {
+		changes[index].Swiplet, changes[index].Path = db.swiplet, db.path
 	}
-	C.swipt_clear_changes(unsafe.Pointer(db.changes))
 	return changes
 }
 
-func columnNames(stmt *C.sqlite3_stmt) []string {
-	names := make([]string, int(C.sqlite3_column_count(stmt)))
+func (db *database) columnNames(stmt sqliteStmt) []string {
+	names := make([]string, db.conn.columnCount(stmt))
 	for index := range names {
-		names[index] = C.GoString(C.sqlite3_column_name(stmt, C.int(index)))
+		names[index] = db.conn.columnName(stmt, index)
 	}
 	return names
 }
 
-func columnValue(stmt *C.sqlite3_stmt, index C.int) any {
-	switch C.sqlite3_column_type(stmt, index) {
-	case C.SQLITE_INTEGER:
-		return int64(C.sqlite3_column_int64(stmt, index))
-	case C.SQLITE_FLOAT:
-		value := float64(C.sqlite3_column_double(stmt, index))
-		if math.IsInf(value, 0) {
+// encodeColumn turns a column read as nil, int64, float64, string or []byte
+// into its JSON form.
+func encodeColumn(value any) any {
+	switch v := value.(type) {
+	case float64:
+		if math.IsInf(v, 0) {
 			return nil
 		}
-		return value
-	case C.SQLITE_TEXT:
-		text := C.sqlite3_column_text(stmt, index)
-		return C.GoStringN((*C.char)(unsafe.Pointer(text)), C.sqlite3_column_bytes(stmt, index))
-	case C.SQLITE_BLOB:
-		data := C.sqlite3_column_blob(stmt, index)
-		return map[string]string{"$b": base64.StdEncoding.EncodeToString(C.GoBytes(data, C.sqlite3_column_bytes(stmt, index)))}
+	case []byte:
+		return map[string]string{"$b": base64.StdEncoding.EncodeToString(v)}
 	}
-	return nil
+	return value
 }

@@ -1,5 +1,3 @@
-//go:build darwin && cgo
-
 package automation
 
 import (
@@ -21,15 +19,11 @@ import (
 )
 
 type Graphics interface {
-	Entry() uintptr
+	Install(context *jsc.Context, native jsc.Value, engine uint64)
+	Uninstall(context *jsc.Context, engine uint64)
 	Run(engine uint64, call int64, context *GraphicsCall) (json.RawMessage, error)
 	Watch(engine uint64, call int64, context *GraphicsCall, publish func(any)) error
 }
-
-const (
-	graphicsInstall int32 = iota
-	graphicsUninstall
-)
 
 const timelineLimit = 100_000
 
@@ -137,7 +131,7 @@ func (e *engine) installGraphics(native jsc.Value) {
 		return
 	}
 	e.graphics = graphicsEngines.Add(1)
-	e.context.RunNative(graphics.Entry(), graphicsInstall, native, e.graphics)
+	graphics.Install(e.context, native, e.graphics)
 }
 
 func (e *engine) uninstallGraphics() {
@@ -145,7 +139,7 @@ func (e *engine) uninstallGraphics() {
 	if graphics == nil || e.graphics == 0 {
 		return
 	}
-	e.context.RunNative(graphics.Entry(), graphicsUninstall, jsc.Value{}, e.graphics)
+	graphics.Uninstall(e.context, e.graphics)
 	e.graphics = 0
 }
 
