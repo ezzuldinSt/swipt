@@ -44,6 +44,10 @@ type Client struct {
 	device           *coredevice.Device
 	logger           logger.ContextLogger
 	deviceIdentifier string
+
+	infoTurn  chan struct{}
+	info      *Info
+	infoAsked time.Time
 }
 
 func New(owner context.Context, device *coredevice.Device, logger logger.ContextLogger) *Client {
@@ -52,6 +56,7 @@ func New(owner context.Context, device *coredevice.Device, logger logger.Context
 		device:           device,
 		logger:           logger,
 		deviceIdentifier: uuid.NewString(),
+		infoTurn:         make(chan struct{}, 1),
 	}
 }
 

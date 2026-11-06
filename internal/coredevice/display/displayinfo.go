@@ -2,11 +2,12 @@ package display
 
 import (
 	"context"
+	"slices"
 	"strconv"
+	"time"
 
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/swipt-automation/swipt/internal/coredevice"
 )
 
 // pymobiledevice3 sends getdisplayinfo to deviceinfo with no action
@@ -28,22 +29,54 @@ type DisplayInfo struct {
 	PointScale                int
 }
 
-func (c *Client) BacklightState(ctx context.Context) (string, error) {
+// Info is one answer to getdisplayinfo, which reports the displays and their
+// backlight together.
+type Info struct {
+	Displays []DisplayInfo
+	output   map[string]any
+}
+
+// Backlight reports the primary integrated display's backlight state: off,
+// inactiveOn, activeOn or dimmed.
+func (i *Info) Backlight() (string, error) {
+	return primaryBacklightState(i.output)
+}
+
+// Info asks the device for its displays on a kept connection. Callers that ask
+// while a request is under way share the next one, and a caller gets the
+// answer of a request made after it asked.
+func (c *Client) Info(ctx context.Context) (*Info, error) {
 	ctx, cancel := c.operationContext(ctx)
 	defer cancel()
 	if err := context.Cause(ctx); err != nil {
-		return "", err
+		return nil, err
 	}
-	conn, err := c.device.DialXPC(ctx, deviceInfoServiceName)
+	asked := time.Now()
+	select {
+	case c.infoTurn <- struct{}{}:
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	}
+	defer func() { <-c.infoTurn }()
+	if c.info != nil && c.infoAsked.After(asked) {
+		return c.info, nil
+	}
+	started := time.Now()
+	output, err := c.device.Service(deviceInfoServiceName).Invoke(ctx, c.deviceIdentifier, featureDisplayInfo, "", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	info := &Info{Displays: displaysOf(output), output: output}
+	c.info, c.infoAsked = info, started
+	return info, nil
+}
+
+func (c *Client) BacklightState(ctx context.Context) (string, error) {
+	info, err := c.Info(ctx)
 	if err != nil {
 		return "", err
 	}
-	defer conn.Close()
-	output, err := coredevice.InvokeFeature(ctx, conn, c.deviceIdentifier, featureDisplayInfo, "", map[string]any{})
-	if err != nil {
-		return "", err
-	}
-	return primaryBacklightState(output)
+	return info.Backlight()
 }
 
 func primaryBacklightState(output map[string]any) (string, error) {
@@ -95,20 +128,14 @@ func primaryBacklightState(output map[string]any) (string, error) {
 }
 
 func (c *Client) Displays(ctx context.Context) ([]DisplayInfo, error) {
-	ctx, cancel := c.operationContext(ctx)
-	defer cancel()
-	if err := context.Cause(ctx); err != nil {
-		return nil, err
-	}
-	conn, err := c.device.DialXPC(ctx, deviceInfoServiceName)
+	info, err := c.Info(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	output, err := coredevice.InvokeFeature(ctx, conn, c.deviceIdentifier, featureDisplayInfo, "", map[string]any{})
-	if err != nil {
-		return nil, err
-	}
+	return slices.Clone(info.Displays), nil
+}
+
+func displaysOf(output map[string]any) []DisplayInfo {
 	return common.Map(array(output["displays"]), func(value any) DisplayInfo {
 		display := dictionary(value)
 		info := DisplayInfo{
@@ -120,7 +147,7 @@ func (c *Client) Displays(ctx context.Context) ([]DisplayInfo, error) {
 		info.Width, info.Height = sizeValue(dictionary(display["currentMode"])["size"])
 		info.NativeWidth, info.NativeHeight = sizeValue(display["nativeSize"])
 		return info
-	}), nil
+	})
 }
 
 func sizeValue(value any) (int, int) {
