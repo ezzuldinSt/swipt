@@ -19,68 +19,6 @@ const DefaultDifferenceThreshold = 24
 // screen has been still this long, in milliseconds (SWChangeTracker.m).
 const changeSettle = 300
 
-// Comparison tells whether successive frames changed in a region (SWScreenComparison.m).
-// Regions at least 64 pixels on their short side compare at a quarter of their size.
-type Comparison struct {
-	region    Rect
-	width     int
-	height    int
-	threshold int
-}
-
-// NewComparison sets up a comparison of region, or the whole image when region is nil, in
-// the space of frame.
-func NewComparison(frame *Image, region *Rect, threshold int) (*Comparison, error) {
-	area := frame.frame()
-	if region != nil {
-		area = *region
-	}
-	pixels, err := frame.PixelRect(area)
-	if err != nil {
-		return nil, err
-	}
-	factor := 1
-	if min(pixels.Dx(), pixels.Dy()) >= 64 {
-		factor = 4
-	}
-	return &Comparison{region: area, width: max(pixels.Dx()/factor, 1), height: max(pixels.Dy()/factor, 1), threshold: threshold}, nil
-}
-
-// Plane is the gray plane of the region that Changed compares.
-func (c *Comparison) Plane(ctx context.Context, frame *Image) (*image.Gray, error) {
-	plane, err := c.plane(ctx, frame)
-	if err != nil {
-		return nil, err
-	}
-	return plane.image().(*image.Gray), nil
-}
-
-// plane shrinks the region and then grays it in the ObjC; graying first is the same up to
-// rounding and shrinks a quarter of the bytes.
-func (c *Comparison) plane(ctx context.Context, frame *Image) (*raster, error) {
-	pixels, err := frame.PixelRect(c.region)
-	if err != nil {
-		return nil, err
-	}
-	r, err := frame.raster(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return resized(grayscale(r.view(pixels.Min.X, pixels.Min.Y, pixels.Dx(), pixels.Dy())), c.width, c.height), nil
-}
-
-// Changed tells whether enough pixels differ between two planes of this comparison.
-func (c *Comparison) Changed(first, second *image.Gray) bool {
-	return c.changed(grayRaster(first), grayRaster(second))
-}
-
-func (c *Comparison) changed(first, second *raster) bool {
-	if first.width != second.width || first.height != second.height {
-		return true
-	}
-	return changedCount(first, second, c.threshold) >= minimumChange(first.width*first.height)
-}
-
 // Change is a stretch of motion: Before is when the last still frame came, Start the first
 // moving one and After the last moving one, all in the tracker's milliseconds. Regions are in
 // pixels of the planes, which are Width by Height.
@@ -300,16 +238,16 @@ type Search struct {
 	arguments  arguments
 	env        Env
 	comparison *Comparison
-	previous   *raster
-	probed     *raster
-	probedAt   float64
-	hasProbed  bool
-	resting    bool
-	frames     int
-	probes     int
-	probing    float64
-	comparing  float64
-	last       float64
+	// The planes of the frame checked last and of the one probed last, and one to fill.
+	previous, probed, spare *levels
+	probedAt                float64
+	hasProbed               bool
+	resting                 bool
+	frames                  int
+	probes                  int
+	probing                 float64
+	comparing               float64
+	last                    float64
 }
 
 // NewSearch reads the targets of screen.find's arguments; the image targets take templates in
@@ -370,8 +308,11 @@ func (s *Search) Check(ctx context.Context, frame *Image) (*Hit, error) {
 	}
 	s.frames++
 	compared := nowMilliseconds()
-	plane, err := s.comparison.plane(ctx, frame)
-	if err != nil {
+	plane := s.spare
+	if plane == nil {
+		plane = s.comparison.newPlane()
+	}
+	if err := s.comparison.fill(ctx, frame, plane); err != nil {
 		return nil, err
 	}
 	fresh := s.probed == nil || s.comparison.changed(s.probed, plane)
@@ -379,7 +320,7 @@ func (s *Search) Check(ctx context.Context, frame *Image) (*Hit, error) {
 	if fresh && s.previous != nil {
 		settled = !s.comparison.changed(s.previous, plane)
 	}
-	s.previous = plane
+	s.previous, s.spare = plane, s.previous
 	s.comparing += nowMilliseconds() - compared
 	if !fresh {
 		s.resting = true
@@ -398,7 +339,10 @@ func (s *Search) Check(ctx context.Context, frame *Image) (*Hit, error) {
 	if !settled && !rested && !due {
 		return nil, nil
 	}
-	s.probed = plane
+	if s.probed == nil {
+		s.probed = s.comparison.newPlane()
+	}
+	s.probed.pix, s.probed.width, s.probed.height = append(s.probed.pix[:0], plane.pix...), plane.width, plane.height
 	s.hasProbed = true
 	s.probedAt = now
 	started := nowMilliseconds()

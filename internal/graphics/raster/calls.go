@@ -496,98 +496,6 @@ func (c *call) threshold() int {
 	return c.arguments.integer("threshold", DefaultDifferenceThreshold)
 }
 
-// callWaitForChange answers the first frame that differs from the given image, or else from
-// the first frame (SWScreenCalls.m).
-func callWaitForChange(c *call) (any, error) {
-	feed := feedOf(c.env)
-	deadline := deadlineOf(c.arguments.timeout())
-	frame, err := feed.Latest(c.ctx)
-	if err != nil {
-		return nil, err
-	}
-	reference := frame
-	if given, isImage := c.object(0).(*Image); isImage && given != nil {
-		reference = given
-	}
-	comparison, err := NewComparison(reference, c.arguments.region(), c.threshold())
-	if err != nil {
-		return nil, err
-	}
-	before, err := comparison.plane(c.ctx, reference)
-	if err != nil {
-		return nil, err
-	}
-	check := c.object(0) != nil
-	for {
-		if !check {
-			frame, err = feed.Next(c.ctx, deadline)
-			if err != nil {
-				return nil, err
-			}
-			if frame == nil {
-				return nil, failure(NameTimeout, "the screen did not change within ", truncated(c.arguments.timeout()), " ms")
-			}
-		}
-		check = false
-		plane, err := comparison.plane(c.ctx, frame)
-		if err != nil {
-			return nil, err
-		}
-		if comparison.changed(before, plane) {
-			return c.keep(frame), nil
-		}
-	}
-}
-
-// callWaitForStable answers the latest frame once the screen has not changed for durationMs.
-func callWaitForStable(c *call) (any, error) {
-	feed := feedOf(c.env)
-	deadline := deadlineOf(c.arguments.timeout())
-	quiet := time.Duration(c.arguments.float("durationMs", 500) * float64(time.Millisecond))
-	frame, err := feed.Latest(c.ctx)
-	if err != nil {
-		return nil, err
-	}
-	comparison, err := NewComparison(frame, c.arguments.region(), c.threshold())
-	if err != nil {
-		return nil, err
-	}
-	last, err := comparison.plane(c.ctx, frame)
-	if err != nil {
-		return nil, err
-	}
-	changedAt := time.Now()
-	for {
-		remaining := quiet - time.Since(changedAt)
-		if remaining <= 0 {
-			return c.keep(frame), nil
-		}
-		if !time.Now().Before(deadline) {
-			return nil, failure(NameTimeout, "the screen did not settle within ", truncated(c.arguments.timeout()), " ms")
-		}
-		until := time.Now().Add(remaining)
-		if deadline.Before(until) {
-			until = deadline
-		}
-		next, err := feed.Next(c.ctx, until)
-		if err != nil {
-			return nil, err
-		}
-		if next == nil {
-			continue
-		}
-		frame = next
-		current, err := comparison.plane(c.ctx, frame)
-		if err != nil {
-			return nil, err
-		}
-		if comparison.changed(last, current) {
-			changedAt = time.Now()
-		}
-		last = current
-	}
-}
-
 // callScreenFind looks for the targets in the latest frame and, with a timeout, in the frames
 // after it until one matches (SWFindCalls.m).
 func callScreenFind(c *call) (any, error) {
@@ -612,6 +520,7 @@ func callScreenFind(c *call) (any, error) {
 		}
 		hit, err := search.Check(c.ctx, frame)
 		if err != nil {
+			frame.Release()
 			return nil, err
 		}
 		if hit != nil {
@@ -624,12 +533,15 @@ func callScreenFind(c *call) (any, error) {
 		var next *Image
 		if timeout != 0 {
 			next, err = feed.Next(c.ctx, deadline)
-			if err != nil {
-				return nil, err
-			}
+		}
+		stamp := frame.timestamp
+		// A frame that matched nothing is not read again.
+		frame.Release()
+		if err != nil {
+			return nil, err
 		}
 		if next == nil {
-			search.trace("screen.find", started, nil, frame.timestamp)
+			search.trace("screen.find", started, nil, stamp)
 			return nil, nil
 		}
 		frame = next
