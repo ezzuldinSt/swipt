@@ -181,8 +181,10 @@ func enteredDigits(value string, length int) (int, bool) {
 }
 
 // SpringBoard posts com.apple.springboard.lockstate when the device locks or
-// unlocks (iPhone18,2, iOS 27.2 24B115).
-const lockStateLife = 30 * time.Second
+// unlocks (iPhone18,2, iOS 27.2 24B115), so a lock state read while the
+// notifications are relayed stays current until one arrives. Without them, it
+// is kept for a second.
+const unrelayedLockStateLife = time.Second
 
 type lockStateReader struct {
 	access sync.Mutex
@@ -191,16 +193,17 @@ type lockStateReader struct {
 	owner    *conn
 	value    bool
 	readAt   time.Time
+	readRun  uint64
 	watching bool
-	relayed  func() bool
+	relaying func() (uint64, bool)
 	unwatch  func()
 }
 
 func (r *lockStateReader) recent(ctx context.Context) (bool, error) {
 	r.access.Lock()
 	if !r.watching && r.owner != nil {
-		changed, relayed, cancel := r.owner.darwin.watch()
-		r.watching, r.relayed, r.unwatch = true, relayed, cancel
+		changed, relaying, cancel := r.owner.darwin.watch()
+		r.watching, r.relaying, r.unwatch = true, relaying, cancel
 		go func() {
 			for {
 				select {
@@ -213,17 +216,33 @@ func (r *lockStateReader) recent(ctx context.Context) (bool, error) {
 			}
 		}()
 	}
-	life := lockStateLife
-	if r.relayed == nil || !r.relayed() {
-		life = time.Second
-	}
-	if !r.readAt.IsZero() && time.Since(r.readAt) < life {
+	if r.currentLocked(time.Now()) {
 		value := r.value
 		r.access.Unlock()
 		return value, nil
 	}
 	r.access.Unlock()
 	return r.locked(ctx, r.owner.device)
+}
+
+func (r *lockStateReader) currentLocked(now time.Time) bool {
+	if r.readAt.IsZero() {
+		return false
+	}
+	if r.relaying != nil {
+		if run, relaying := r.relaying(); relaying && run == r.readRun {
+			return true
+		}
+	}
+	return now.Sub(r.readAt) < unrelayedLockStateLife
+}
+
+func (r *lockStateReader) run() uint64 {
+	if r.relaying == nil {
+		return 0
+	}
+	run, _ := r.relaying()
+	return run
 }
 
 func (r *lockStateReader) forget() {
@@ -238,24 +257,39 @@ func (r *lockStateReader) locked(ctx context.Context, device *coredevice.Device)
 	}
 	r.access.Lock()
 	defer r.access.Unlock()
+	run := r.run()
+	var state coredevice.LockState
+	err := r.useLocked(ctx, device, func(conn *coredevice.LockStateConn) (err error) {
+		state, err = conn.LockState(ctx)
+		return
+	})
+	if err != nil {
+		return false, err
+	}
+	r.value, r.readAt, r.readRun = state.PasscodeRequired, time.Now(), run
+	return state.PasscodeRequired, nil
+}
+
+// useLocked runs read on the kept lockdown connection, connecting again when
+// one kept from an earlier read fails.
+func (r *lockStateReader) useLocked(ctx context.Context, device *coredevice.Device, read func(conn *coredevice.LockStateConn) error) error {
 	for {
 		reused := r.conn != nil
 		if !reused {
 			conn, err := device.DialLockState(ctx)
 			if err != nil {
-				return false, err
+				return err
 			}
 			r.conn = conn
 		}
-		state, err := r.conn.LockState(ctx)
+		err := read(r.conn)
 		if err == nil {
-			r.value, r.readAt = state.PasscodeRequired, time.Now()
-			return state.PasscodeRequired, nil
+			return nil
 		}
 		r.conn.Close()
 		r.conn = nil
 		if !reused || ctx.Err() != nil {
-			return false, err
+			return err
 		}
 	}
 }
@@ -265,7 +299,7 @@ func (r *lockStateReader) close() error {
 	defer r.access.Unlock()
 	if r.unwatch != nil {
 		r.unwatch()
-		r.unwatch, r.watching = nil, false
+		r.unwatch, r.watching, r.relaying = nil, false, nil
 	}
 	if r.conn == nil {
 		return nil

@@ -23,6 +23,10 @@ var stateNotifications = []string{
 const (
 	lockedPoll  = 5 * time.Second
 	displayPoll = time.Second
+
+	relayRetryFirst   = time.Second
+	relayRetryLongest = 30 * time.Second
+	relayStable       = time.Minute
 )
 
 type darwinNotifications struct {
@@ -31,6 +35,8 @@ type darwinNotifications struct {
 	access   sync.Mutex
 	watchers map[chan struct{}]struct{}
 	active   *notificationRelay
+	// runs counts the relay's runs that started relaying.
+	runs uint64
 }
 
 type notificationRelay struct {
@@ -47,7 +53,11 @@ func newDarwinNotifications(c *conn) *darwinNotifications {
 	return &darwinNotifications{conn: c, watchers: make(map[chan struct{}]struct{})}
 }
 
-func (d *darwinNotifications) watch() (changed <-chan struct{}, relayed func() bool, cancel func()) {
+// watch signals each relayed notification. relaying reports which run of the
+// relay this is and whether it relays now: a state read while it relays stays
+// current until a notification arrives, as long as the run is the same, since
+// a new run may have missed notifications before it started.
+func (d *darwinNotifications) watch() (changed <-chan struct{}, relaying func() (uint64, bool), cancel func()) {
 	signal := make(chan struct{}, 1)
 	d.access.Lock()
 	d.watchers[signal] = struct{}{}
@@ -58,23 +68,27 @@ func (d *darwinNotifications) watch() (changed <-chan struct{}, relayed func() b
 	}
 	d.access.Unlock()
 	var once sync.Once
-	return signal, func() bool {
+	return signal, d.relaying, func() {
+		once.Do(func() {
 			d.access.Lock()
 			defer d.access.Unlock()
-			return d.active != nil && d.active.relayed
-		}, func() {
-			once.Do(func() {
-				d.access.Lock()
-				defer d.access.Unlock()
-				delete(d.watchers, signal)
-				if len(d.watchers) == 0 && d.active != nil {
-					d.active.stop()
-					d.active = nil
-				}
-			})
-		}
+			delete(d.watchers, signal)
+			if len(d.watchers) == 0 && d.active != nil {
+				d.active.stop()
+				d.active = nil
+			}
+		})
+	}
 }
 
+func (d *darwinNotifications) relaying() (uint64, bool) {
+	d.access.Lock()
+	defer d.access.Unlock()
+	return d.runs, d.active != nil && d.active.relayed
+}
+
+// waitReady waits until the relay observes the notifications, or its first
+// run failed.
 func (d *darwinNotifications) waitReady(ctx context.Context) error {
 	d.access.Lock()
 	active := d.active
@@ -103,16 +117,30 @@ func (d *darwinNotifications) waitReady(ctx context.Context) error {
 	return active.ctx.Err()
 }
 
+// observe relays the notifications until stopped, starting the relay again
+// after it fails.
 func (d *darwinNotifications) observe(active *notificationRelay) {
 	defer close(active.stopped)
-	err := d.relay(active)
-	d.access.Lock()
-	active.err = err
-	active.relayed = false
-	active.readyOnce.Do(func() { close(active.ready) })
-	d.access.Unlock()
-	if err != nil && active.ctx.Err() == nil {
+	delay := relayRetryFirst
+	for {
+		started := time.Now()
+		err := d.relay(active)
+		d.access.Lock()
+		active.err = err
+		active.relayed = false
+		active.readyOnce.Do(func() { close(active.ready) })
+		d.access.Unlock()
+		if active.ctx.Err() != nil {
+			return
+		}
 		d.conn.logger.Debug(E.Cause(err, "observe the device's lock and display notifications"))
+		if time.Since(started) >= relayStable {
+			delay = relayRetryFirst
+		}
+		if sleep(active.ctx, delay) != nil {
+			return
+		}
+		delay = min(delay*2, relayRetryLongest)
 	}
 }
 
@@ -132,6 +160,10 @@ func (d *darwinNotifications) relay(active *notificationRelay) error {
 	}
 	d.access.Lock()
 	active.relayed = ctx.Err() == nil
+	if active.relayed {
+		active.err = nil
+		d.runs++
+	}
 	active.readyOnce.Do(func() { close(active.ready) })
 	d.access.Unlock()
 	for {
@@ -194,7 +226,7 @@ func (p *Phone) WatchState(ctx context.Context, name string, emit func(any)) err
 		if err != nil {
 			return err
 		}
-		changed, relayed, cancel := c.darwin.watch()
+		changed, relaying, cancel := c.darwin.watch()
 		operation, stop := c.operation(ctx)
 		for operation.Err() == nil {
 			value, err := read(operation, c)
@@ -206,7 +238,7 @@ func (p *Phone) WatchState(ctx context.Context, name string, emit func(any)) err
 				emit(value)
 			}
 			wait := poll
-			if !relayed() {
+			if _, relayed := relaying(); !relayed {
 				wait = displayPoll
 			}
 			timer := time.NewTimer(wait)
