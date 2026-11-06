@@ -384,7 +384,11 @@ func (e *engine) take(js *jsc.Context, arguments []jsc.Value) (any, error) {
 	}
 	object := e.object(int64(arguments[0].Number()))
 	switch it := object.(type) {
-	case *raster.Image, *recognize.Text, *videoModel:
+	case *raster.Image:
+		// As SWNative.m reports a node's cost when it hands an image to JavaScript.
+		js.ReportExternalCost(int64(it.EstimatedBytes()))
+		return js.NewHostObject(object, nil), nil
+	case *recognize.Text, *videoModel:
 		return js.NewHostObject(object, nil), nil
 	case *recordingSession:
 		// A recording whose handle goes without being stopped stops itself (SWHandles.m dealloc).
@@ -430,6 +434,7 @@ func (e *engine) op(js *jsc.Context, arguments []jsc.Value) (any, error) {
 		return numbers[index]
 	}
 	handle := func(image *raster.Image) any {
+		js.ReportExternalCost(int64(image.EstimatedBytes()))
 		return js.NewHostObject(image, nil)
 	}
 	switch it := payload.(type) {

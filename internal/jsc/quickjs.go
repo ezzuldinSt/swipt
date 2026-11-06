@@ -26,6 +26,8 @@ import (
 type Context struct {
 	commands  chan *command
 	cancelled atomic.Uint64
+	external  atomic.Int64
+	collect   atomic.Bool
 
 	// The rest belongs to the engine's goroutine.
 	tls          *libc.TLS
@@ -84,6 +86,9 @@ type host struct {
 }
 
 const (
+	// The external memory that makes the outermost call collect when it returns.
+	externalCollection = 256 << 20
+
 	valueSize    = unsafe.Sizeof(lib.TJSValue{})
 	scratchWords = 4
 	jsonFile     = "<json>"
@@ -299,6 +304,16 @@ func (c *Context) NewHostObject(payload any, finalize func()) Value {
 		c.hold(object)
 	})
 	return Value{c, object}
+}
+
+// ReportExternalCost tells the engine about memory that its objects keep alive outside it, like
+// JSReportExtraMemoryCost: QuickJS counts only its own allocations, so a cycle that holds a large
+// host object would otherwise wait for its next collection long after the memory ran out.
+func (c *Context) ReportExternalCost(bytes int64) {
+	if bytes > 0 && c.external.Add(bytes) >= externalCollection {
+		c.external.Store(0)
+		c.collect.Store(true)
+	}
 }
 
 func (c *Context) Evaluate(source, url string) (Value, error) {
@@ -545,6 +560,11 @@ func (c *Context) checkpoint() {
 	if len(c.running) != 1 {
 		return
 	}
+	defer func() {
+		if c.collect.Swap(false) {
+			lib.XJS_RunGC(c.tls, c.runtime)
+		}
+	}()
 	for !c.terminated {
 		switch ran := lib.XJS_ExecutePendingJob(c.tls, c.runtime, c.scratch); {
 		case ran < 0:
