@@ -75,7 +75,8 @@ func Rounded(value float64) float64 {
 	return rounded(value)
 }
 
-// NowMilliseconds is the time since the epoch in milliseconds.
+// NowMilliseconds is the time since the epoch in milliseconds, on the clock the screen
+// feed stamps its frames with.
 func NowMilliseconds() float64 {
 	return nowMilliseconds()
 }

@@ -695,7 +695,7 @@ func (v environment) screen(ctx context.Context) (*raster.Image, error) {
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
-	return raster.Decode(data, scale, float64(time.Now().UnixMicro())/1000)
+	return raster.Decode(data, scale, raster.NowMilliseconds())
 }
 
 func firstImage(it *prepared) (*raster.Image, bool) {

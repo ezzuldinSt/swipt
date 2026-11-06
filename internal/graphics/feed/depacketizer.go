@@ -32,7 +32,11 @@ type AccessUnit struct {
 	NALs         [][]byte
 	RTPTimestamp uint32
 	// Arrival is when the first packet of the unit arrived, in milliseconds since the epoch.
+	// The feed takes it from its precise clock as the packet reaches it, Received.
 	Arrival float64
+	// Received is the reading of the feed's clock (internal/graphics/clock.Ticks) when the
+	// batch with the unit's first packet reached it, 0 for units the feed did not stamp.
+	Received int64
 	// Profile is the "defined by profile" field of the first packet's RTP header extension.
 	Profile uint16
 	// Damaged is set when a packet of the unit, or one before it, was lost or malformed.
@@ -76,6 +80,8 @@ type Depacketizer struct {
 	fragment     []byte
 	hasSequence  bool
 	lastSequence uint16
+	// received stamps the units that the next packets start.
+	received int64
 }
 
 // Reset forgets the unit in progress and the last sequence number, as when the stream reopens.
@@ -144,7 +150,7 @@ func (d *Depacketizer) Push(packet []byte, arrival float64, done []*AccessUnit) 
 	}
 	unit := d.current
 	if unit == nil {
-		unit = &AccessUnit{RTPTimestamp: timestamp, Arrival: arrival, Profile: profile}
+		unit = &AccessUnit{RTPTimestamp: timestamp, Arrival: arrival, Received: d.received, Profile: profile}
 	}
 	if gap {
 		unit.Damaged = true

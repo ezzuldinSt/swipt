@@ -2,7 +2,8 @@ package raster
 
 import (
 	"math"
-	"time"
+
+	"github.com/swipt-automation/swipt/internal/graphics/clock"
 )
 
 // Rect is [x, y, width, height], as the JavaScript API writes it.
@@ -71,8 +72,9 @@ func roundedCenter(r Rect) Point {
 	return roundedPoint(r.standard().center())
 }
 
+// nowMilliseconds reads the precise clock, as the screen feed stamps its frames.
 func nowMilliseconds() float64 {
-	return float64(time.Now().UnixMicro()) / 1000
+	return clock.Now()
 }
 
 // transform is a CGAffineTransform: x' = a·x + c·y + tx, y' = b·x + d·y + ty.
