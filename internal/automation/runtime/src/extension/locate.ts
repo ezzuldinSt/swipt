@@ -2,9 +2,16 @@ import type { Point, Rect } from "@swipt/api";
 import type { RecognizedTextLine } from "@swipt/api/image";
 import type { Located, LocateSource } from "@swipt/api/screen";
 
-import { find, hitTest, type HitElement } from "./accessibility";
+import { hitTest, type HitElement } from "./accessibility";
 import { invoke } from "./async";
-import type { AccessibilityElement } from "./elements";
+import {
+  encode,
+  pick,
+  snapshotOf,
+  type AccessibilityElement,
+  type AccessibilitySnapshot,
+  type RawSnapshot,
+} from "./elements";
 import { imageResult, rectOf, run, type RasterImage } from "./image";
 import { optionsOf, signalOf, type Options } from "./options";
 
@@ -202,34 +209,29 @@ export const locate = async (
         at[1] <= area[1] + area[3]));
 
   const selectors = selectorsOf(target);
-  const element: AccessibilityElement | null = await find(selectors, {
-    signal,
-  });
-  if (
-    element !== null &&
-    inside(element.point) &&
-    element.frame !== undefined
-  ) {
-    const index = Math.max(
-      selectors.findIndex((selector) => {
-        const [field, pattern] = Object.entries(selector)[0] as [
-          "label" | "value",
-          RegExp,
-        ];
-        const text = element[field];
-        return text !== undefined && text.search(pattern) >= 0;
-      }),
-      0,
-    );
-    return Object.freeze({
-      text: (index === 1 ? element.value : element.label) ?? "",
-      frame: element.frame,
-      point: element.point!,
-      score: accessibilityScores[index] ?? 1,
-      source: "accessibility",
-      confirmed: true,
-      element,
-    });
+  const found = await invoke<{ snapshot: RawSnapshot | null }>(
+    "accessibility.find",
+    [selectors.map((selector) => encode(selector).value)],
+    { signal },
+  );
+  const snapshot = found.snapshot === null ? null : snapshotOf(found.snapshot);
+  for (const [index, selector] of selectors.entries()) {
+    const element = snapshot === null ? null : pick(snapshot, selector, "best");
+    if (
+      element !== null &&
+      inside(element.point) &&
+      element.frame !== undefined
+    ) {
+      return Object.freeze({
+        text: (index === 1 ? element.value : element.label) ?? "",
+        frame: element.frame,
+        point: element.point!,
+        score: accessibilityScores[index] ?? 1,
+        source: "accessibility",
+        confirmed: true,
+        element,
+      });
+    }
   }
 
   const frame: RasterImage = await imageResult(
@@ -267,6 +269,35 @@ export const locate = async (
   }
   const { line, run: span, source } = best;
   const box = line.boundingBox(span.start, span.end) ?? line;
+  const text = line.text.slice(span.start, span.end);
+  const answer = (
+    point: Point,
+    confirmed: boolean,
+    element?: AccessibilityElement,
+  ): Located | null => {
+    let score = span.score * (confirmed ? 1 : unconfirmed);
+    if (source === "lightText") {
+      score *= lightText;
+    }
+    return score < threshold
+      ? null
+      : Object.freeze({
+          text,
+          frame: (element?.frame ?? box.frame) as Rect,
+          point,
+          score: Math.round(score * 1000) / 1000,
+          source,
+          confirmed,
+          ...(element === undefined ? {} : { element }),
+        });
+  };
+  const owner =
+    snapshot === null
+      ? null
+      : ownerOf(snapshot, box.frame as Rect, target, threshold);
+  if (owner !== null) {
+    return answer(owner.point!, true, owner);
+  }
   const center = box.center;
   const front = await invoke<string>("device.state", ["foreground"], {
     signal,
@@ -276,33 +307,83 @@ export const locate = async (
   const hits = await hitTest(home ? [center, icon] : [center], signal).catch(
     () => [] as (HitElement | null)[],
   );
-  let point = center;
-  let confirmed = false;
-  if (home && hitScore(target, hits[1] ?? null) >= threshold) {
-    point = icon;
-    confirmed = true;
-  } else if (hitScore(target, hits[0] ?? null) >= threshold) {
-    confirmed = true;
-  } else if (
+  for (const [index, hit] of hits.entries()) {
+    if (hit !== null && hitScore(target, hit) >= threshold) {
+      return answer(hit.point ?? (index === 1 ? icon : center), true);
+    }
+  }
+  if (
     home &&
     box.frame[3] <= iconLabelHeight &&
     tokens(line.text).length <= 3
   ) {
-    point = icon;
+    return answer(icon, false);
   }
-  let score = span.score * (confirmed ? 1 : unconfirmed);
-  if (source === "lightText") {
-    score *= lightText;
+  return answer(center, false);
+};
+
+// A Home Screen or Dock icon's element is no larger than this, in points.
+const iconLargest = 200;
+// An icon's label sits this close under it.
+const labelGap = 24;
+
+const iconRoles = ["icon", "button", "image"];
+
+// ownerOf finds the element text read off the screen belongs to: one whose
+// frame holds the text's middle, or ends just above the text over it, as an
+// icon above its label does, whose own label matches the target or that is
+// an icon or button; of several, the best match, then the smallest.
+const ownerOf = (
+  snapshot: AccessibilitySnapshot,
+  box: Rect,
+  target: string | RegExp,
+  threshold: number,
+): AccessibilityElement | null => {
+  const [x, y, width, height] = box;
+  const middle: Point = [x + width / 2, y + height / 2];
+  let best: {
+    element: AccessibilityElement;
+    score: number;
+    area: number;
+  } | null = null;
+  for (const element of snapshot.findAll(
+    (it) => it.frame !== undefined && it.point !== undefined,
+  )) {
+    const [left, top, across, down] = element.frame!;
+    if (
+      element.role === "application" ||
+      across > iconLargest ||
+      down > iconLargest ||
+      middle[0] < left ||
+      middle[0] > left + across
+    ) {
+      continue;
+    }
+    const holds = middle[1] >= top && middle[1] <= top + down;
+    const above =
+      top < y && top + down >= y - labelGap && top + down <= y + height;
+    if (!holds && !above) {
+      continue;
+    }
+    const score = Math.max(
+      textScore(target, element.label),
+      textScore(target, element.value),
+    );
+    if (
+      score < threshold &&
+      !iconRoles.includes(element.role) &&
+      !element.traits.includes("button")
+    ) {
+      continue;
+    }
+    const area = across * down;
+    if (
+      best === null ||
+      score > best.score ||
+      (score === best.score && area < best.area)
+    ) {
+      best = { element, score, area };
+    }
   }
-  if (score < threshold) {
-    return null;
-  }
-  return Object.freeze({
-    text: line.text.slice(span.start, span.end),
-    frame: box.frame as Rect,
-    point,
-    score: Math.round(score * 1000) / 1000,
-    source,
-    confirmed,
-  });
+  return best?.element ?? null;
 };

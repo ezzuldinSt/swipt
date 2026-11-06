@@ -471,6 +471,8 @@ export interface HitElement {
   value?: string;
   identifier?: string;
   role: string;
+  frame?: [number, number, number, number];
+  point?: Point;
 }
 
 // hitTest names the element a tap at each point would reach.

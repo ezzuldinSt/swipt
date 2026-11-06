@@ -155,13 +155,14 @@ export interface Located {
   /** The text that matched. */
   readonly text: string;
   readonly frame: Rect;
-  /** Where a tap reaches the target: an element's point, the text's center, or on the Home Screen the icon above its label. */
+  /** Where a tap reaches the target: an element's point, or for text read off the frame the point of the element it belongs to (on the Home Screen and in the Dock the icon above its label), else the text's center. */
   readonly point: Point;
   /** From 0 to 1: how closely the text matches, less for text a hit test did not confirm and for the light-text pass. */
   readonly score: number;
   readonly source: LocateSource;
-  /** The element came from accessibility, or a hit test at the point reached an element with this text. */
+  /** The element came from accessibility, the text lies on or right under an element, or a hit test at the point reached an element with this text. */
   readonly confirmed: boolean;
+  /** The element found by accessibility, or the one text read off the frame belongs to, such as the icon over a label. */
   readonly element?: AccessibilityElement;
 }
 

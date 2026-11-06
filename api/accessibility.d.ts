@@ -147,8 +147,12 @@ export interface ObserveOptions {
   readonly observe?: "snapshot" | "frame";
 }
 
-/** "target": the screen changed at the element (or within 44 pt of a tapped point) after the touch; "elsewhere": it changed only away from it, or the device reported the element went, moved or another app came to the front; "none": nothing changed within 800 ms. A correct tap can change nothing visible, as on a control already in that state, so "none" is advice, not an error. */
-export type TapEffect = "target" | "elsewhere" | "none";
+/**
+ * "target": the screen changed at the element (or within 44 pt of a tapped point) after the touch, and was still changed 350 ms later; "elsewhere": it changed only away from it, or the device reported the element went, moved or another app came to the front.
+ * "moved": the element moved away from the touch as it went, as a list does that loads after a launch, so the touch most likely reached another element, which the detail names when the hit test can; the tap is not tried again.
+ * "none": nothing changed within 800 ms, or the change went back, as a press highlight or an icon's bounce does. A correct tap can change nothing visible, as on a control already in that state, so "none" is advice, not an error.
+ */
+export type TapEffect = "target" | "elsewhere" | "moved" | "none";
 
 export interface TapAttempt {
   /** "tap", "saferTap" (at the element's visible edge farthest from the app's bars), "scroll" (bringing it 80 pt clear of the bars) or "press" (its accessibility action). */
@@ -184,7 +188,7 @@ export interface TapElementOptions extends ElementOptions, ObserveOptions {
   readonly scroll?: boolean;
 }
 
-/** A selector picks its match as find does, and throws when several rank alike, listing them. An element off the screen or under the app's own bars, in a scroll view, is first scrolled 80 pt clear of the bars. */
+/** A selector picks its match as find does, and throws when several rank alike, listing them. An element off the screen or under the app's own bars, in a scroll view, is first scrolled 80 pt clear of the bars. An element of an app that came to the front less than 1.5 s ago, or that moved since its read, is tapped only once two reads of its frame 100 ms apart agree, waiting up to 1 s; one that moved is read again first. */
 export declare function tap(
   element: AccessibilityElement | AccessibilitySelector,
   options?: TapElementOptions,
