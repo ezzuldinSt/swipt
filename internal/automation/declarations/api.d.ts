@@ -428,8 +428,12 @@ declare module "@swipt/api/accessibility" {
     readonly observe?: "snapshot" | "frame";
   }
 
-  /** "target": the screen changed at the element (or within 44 pt of a tapped point) after the touch; "elsewhere": it changed only away from it, or the device reported the element went, moved or another app came to the front; "none": nothing changed within 800 ms. A correct tap can change nothing visible, as on a control already in that state, so "none" is advice, not an error. */
-  export type TapEffect = "target" | "elsewhere" | "none";
+  /**
+   * "target": the screen changed at the element (or within 44 pt of a tapped point) after the touch, and was still changed 350 ms later; "elsewhere": it changed only away from it, or the device reported the element went, moved or another app came to the front.
+   * "moved": the element moved away from the touch as it went, as a list does that loads after a launch, so the touch most likely reached another element, which the detail names when the hit test can; the tap is not tried again.
+   * "none": nothing changed within 800 ms, or the change went back, as a press highlight or an icon's bounce does. A correct tap can change nothing visible, as on a control already in that state, so "none" is advice, not an error.
+   */
+  export type TapEffect = "target" | "elsewhere" | "moved" | "none";
 
   export interface TapAttempt {
     /** "tap", "saferTap" (at the element's visible edge farthest from the app's bars), "scroll" (bringing it 80 pt clear of the bars) or "press" (its accessibility action). */
@@ -465,7 +469,7 @@ declare module "@swipt/api/accessibility" {
     readonly scroll?: boolean;
   }
 
-  /** A selector picks its match as find does, and throws when several rank alike, listing them. An element off the screen or under the app's own bars, in a scroll view, is first scrolled 80 pt clear of the bars. */
+  /** A selector picks its match as find does, and throws when several rank alike, listing them. An element off the screen or under the app's own bars, in a scroll view, is first scrolled 80 pt clear of the bars. An element of an app that came to the front less than 1.5 s ago, or that moved since its read, is tapped only once two reads of its frame 100 ms apart agree, waiting up to 1 s; one that moved is read again first. */
   export function tap(
     element: AccessibilityElement | AccessibilitySelector,
     options?: TapElementOptions,
@@ -788,13 +792,14 @@ declare module "@swipt/api/screen" {
     /** The text that matched. */
     readonly text: string;
     readonly frame: Rect;
-    /** Where a tap reaches the target: an element's point, the text's center, or on the Home Screen the icon above its label. */
+    /** Where a tap reaches the target: an element's point, or for text read off the frame the point of the element it belongs to (on the Home Screen and in the Dock the icon above its label), else the text's center. */
     readonly point: Point;
     /** From 0 to 1: how closely the text matches, less for text a hit test did not confirm and for the light-text pass. */
     readonly score: number;
     readonly source: LocateSource;
-    /** The element came from accessibility, or a hit test at the point reached an element with this text. */
+    /** The element came from accessibility, the text lies on or right under an element, or a hit test at the point reached an element with this text. */
     readonly confirmed: boolean;
+    /** The element found by accessibility, or the one text read off the frame belongs to, such as the icon over a label. */
     readonly element?: AccessibilityElement;
   }
 
