@@ -52,7 +52,7 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 		return Aim{}, err
 	}
 	defer done()
-	geometry, err := p.prepare(ctx, c, true)
+	geometry, err := p.prepare(ctx, c, true, true)
 	if err != nil {
 		return Aim{}, err
 	}
