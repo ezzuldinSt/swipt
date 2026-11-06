@@ -162,6 +162,20 @@ type graphicsPrewarmer interface {
 	Prewarm()
 }
 
+// graphicsActor is a Graphics that hears when an action on the device starts and ends, as
+// the cached screenshot does, which an action makes stale.
+type graphicsActor interface {
+	Acting() (done func())
+}
+
+// acting tells the graphics that an action starts, and answers what tells them it ended.
+func (h *Host) acting() func() {
+	if actor, ok := h.options.Graphics.(graphicsActor); ok {
+		return actor.Acting()
+	}
+	return func() {}
+}
+
 // prewarmGraphics starts opening the screen stream as a script starts, where
 // the graphics can, so its first screen call does not wait for it.
 func (h *Host) prewarmGraphics() {

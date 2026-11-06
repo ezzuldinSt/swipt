@@ -440,7 +440,10 @@ func (f *Feed) decoded(s *session, picture *picture, unit *AccessUnit) {
 	}
 	made := &frame{picture: picture, time: unit.Arrival, received: unit.Received, decoded: decodedAt, turns: unit.Turns(), geometry: f.geometry, feed: f}
 	made.totals = unit.totals
-	made.info = FrameInfo{Unit: unit.Info, SincePrevious: unit.totals.since(f.framedTotals), Arrival: unit.Arrival, Decoded: f.clock.wall(decodedAt)}
+	made.info = FrameInfo{
+		Unit: unit.Info, SincePrevious: unit.totals.since(f.framedTotals), Arrival: unit.Arrival, Decoded: f.clock.wall(decodedAt),
+		Media: float64(picture.time) / 1e4,
+	}
 	f.framedTotals = unit.totals
 	made.refs.Store(int32(1 + len(f.frameListeners)))
 	f.replaceLatestLocked(made)

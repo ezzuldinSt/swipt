@@ -79,6 +79,10 @@ type FrameInfo struct {
 	// Arrival is when the unit's first packet reached the feed and Decoded when its picture came
 	// out of the decoder, in milliseconds since the epoch on the precise clock.
 	Arrival, Decoded float64
+	// Media is the picture's time on the device's clock, its RTP timestamp, in milliseconds
+	// since the stream's first unit: arrival less media is least for the frames the network
+	// held back least.
+	Media float64
 }
 
 // unitTotals are a feed's running counts at an access unit: units and bytes up to and
