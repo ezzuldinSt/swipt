@@ -5,6 +5,7 @@ import (
 	"context"
 	"image"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -294,6 +295,9 @@ func (f *Feed) closeIfIdle() {
 	f.access.Unlock()
 	closing.Close()
 	stopping.stop()
+	// A stream goes through some 30 MB of frames a second, which the Go runtime would keep
+	// from the system long after the stream stopped.
+	go debug.FreeOSMemory()
 }
 
 // detachLocked forgets the stream and its decoding; the caller closes and stops them.
@@ -320,6 +324,9 @@ func (f *Feed) Close() {
 	f.access.Unlock()
 	closing.Close()
 	stopping.stop()
+	// A stream goes through some 30 MB of frames a second, which the Go runtime would keep
+	// from the system long after the stream stopped.
+	go debug.FreeOSMemory()
 }
 
 // RequestKeyFrame asks the device for a keyframe, as the recording does when it starts.
