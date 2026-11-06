@@ -42,8 +42,9 @@ const (
 // keyboard.
 func (n *PhoneNode) bars() []Rect {
 	var out []Rect
+	scroll := n.scroller()
 	walkNodes(n.model.Root, func(it *PhoneNode) {
-		if it == n || !it.Shown() || it.Contains(n) || n.Contains(it) || n.scroll != nil && n.scroll.holds(it) {
+		if it == n || !it.Shown() || it.Contains(n) || n.Contains(it) || scroll != nil && scroll.holds(it) {
 			return
 		}
 		keyboard := elementType(it.AX.Type) == typeKeyboard
@@ -120,7 +121,7 @@ func (n *PhoneNode) doubt() string {
 // clear of them when that leaves no room for the element.
 func (n *PhoneNode) clearArea() Rect {
 	screen := Rect{Width: n.space.geometry.Width, Height: n.space.geometry.Height}
-	view := n.scroll.Visible.Intersect(screen)
+	view := n.scroller().Visible.Intersect(screen)
 	area := func(clearance float64) Rect {
 		top, bottom := view.Y, view.Y+view.Height
 		middle := view.Y + view.Height/2
@@ -205,7 +206,7 @@ func (p *Phone) Placement(ctx context.Context, ref string) (Placement, error) {
 	if err != nil {
 		return Placement{}, err
 	}
-	return Placement{Shown: node.Shown(), Covered: node.coveredInApp() && !node.Inert, Scrolls: node.scroll != nil && node.HasFrame()}, nil
+	return Placement{Shown: node.Shown(), Covered: node.coveredInApp() && !node.Inert, Scrolls: node.scroller() != nil && node.HasFrame()}, nil
 }
 
 // Scrolled is how bringing an element into view went.
@@ -237,7 +238,7 @@ func (p *Phone) ScrollIntoView(ctx context.Context, ref string) (Scrolled, error
 		return Scrolled{}, err
 	}
 	name := describeElement(node.AX)
-	if !node.HasFrame() || node.scroll == nil {
+	if !node.HasFrame() || node.scroller() == nil {
 		return Scrolled{}, E.New(name, " is in no scroll view")
 	}
 	area := node.clearArea()
@@ -426,7 +427,7 @@ func (p *Phone) ScrollPage(ctx context.Context, ref, direction string) (Paged, e
 	if err != nil {
 		return Paged{}, err
 	}
-	scroll := element.model.largestScroll()
+	scroll := element.model.scrollFor(element)
 	if scroll == nil {
 		return Paged{}, E.Extend(ErrNotFound, element.model.BundleID, " shows no scroll view")
 	}
@@ -537,16 +538,55 @@ func pageDrag(scroll *PhoneNode, direction string) (Point, Point) {
 	return Point{left, y}, Point{left + (right-left)*0.75, y}
 }
 
-// largestScroll is the shown scroll view of the application that shows the
-// most.
-func (m *PhoneModel) largestScroll() *PhoneNode {
+// scrollFor picks the scroll view a page scroll moves for the element: of the
+// shown scroll views of the application that show accessibility elements,
+// the innermost one holding the element, else the one nearest it, the
+// largest of those alike. Settings also holds an empty collection view as
+// large as its list (iPhone18,2, iOS 27.0.1 24A446).
+func (m *PhoneModel) scrollFor(element *PhoneNode) *PhoneNode {
 	var out *PhoneNode
+	var outHolds bool
+	var outDistance float64
+	at := element.Visible.Center()
 	walkNodes(m.Root, func(node *PhoneNode) {
-		if scrolls(node.AX) && node.Shown() && !node.Inert && (out == nil || node.Visible.area() > out.Visible.area()) {
-			out = node
+		if !scrolls(node.AX) || !node.Shown() || node.Inert || !node.showsElements() {
+			return
 		}
+		holds := node != element && node.Contains(element)
+		distance := node.Visible.distance(at)
+		switch {
+		case out == nil, holds && !outHolds:
+		case holds && outHolds:
+			if !out.Contains(node) {
+				return
+			}
+		case outHolds, distance > outDistance+0.5:
+			return
+		case distance >= outDistance-0.5 && node.Visible.area() <= out.Visible.area():
+			return
+		}
+		out, outHolds, outDistance = node, holds, distance
 	})
 	return out
+}
+
+// showsElements tells whether a shown accessibility element lies in the node.
+func (n *PhoneNode) showsElements() bool {
+	shows := false
+	walkNodes(n, func(node *PhoneNode) {
+		shows = shows || node != n && node.AX.AccessibilityElement && node.Shown()
+	})
+	return shows
+}
+
+// scroller is the nearest shown scroll view holding the node, or nil.
+func (n *PhoneNode) scroller() *PhoneNode {
+	for node := n.scroll; node != nil; node = node.scroll {
+		if node.Shown() {
+			return node
+		}
+	}
+	return nil
 }
 
 // references picks pageReferences shown elements of the scroll view, spread
