@@ -162,6 +162,12 @@ func (p *Phone) element(c *conn, ref string) (*PhoneNode, error) {
 }
 
 func (p *Phone) Perform(ctx context.Context, ref, name string) (Aim, error) {
+	return p.PerformAction(ctx, ref, name, nil)
+}
+
+// PerformAction performs the element's action as Perform does, running ready
+// just before it; the aim names the element as the read had it.
+func (p *Phone) PerformAction(ctx context.Context, ref, name string, ready func(ctx context.Context)) (Aim, error) {
 	c, ctx, done, err := p.begin(ctx)
 	if err != nil {
 		return Aim{}, err
@@ -180,13 +186,21 @@ func (p *Phone) Perform(ctx context.Context, ref, name string) (Aim, error) {
 		if err != nil {
 			return err
 		}
-		s.target = Aim{Element: describeElement(node.AX)}
+		element := node.AX
+		s.target = Aim{
+			Element: describeElement(element), Visible: node.Visible, Risky: riskyWord(element), Selected: element.Selected,
+			mark: Mark{element: &element, front: node.model.Root.AX.Ref.PID, generation: node.model.generation},
+		}
+		if ready != nil {
+			ready(ctx)
+		}
 		return s.perform(ctx, node, name)
 	})
 	p.connection.trace(started, "perform.element", s.target.String()+", "+name, time.Since(started))
 	if s.acted {
 		c.events.publish(Event{Kind: EventInput})
 		c.front.acted()
+		s.target.mark.conn, s.target.mark.screens = c, c.events.screen.Load()
 	}
 	return s.target, err
 }

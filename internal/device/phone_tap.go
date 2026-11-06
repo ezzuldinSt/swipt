@@ -23,6 +23,18 @@ type Aim struct {
 	Element string
 	Point   Point
 	Secure  bool
+	// Visible is the part of the element on the screen, where a tap's effect
+	// shows first.
+	Visible Rect
+	// Risky is the word of the element's label or identifier that makes acting
+	// on it irreversible or outward, such as "Delete" or "Send"; nothing acts on
+	// such an element again on its own.
+	Risky string
+	// Selected tells that the element was selected as the tap went, so the tap
+	// may rightly change nothing.
+	Selected bool
+
+	mark Mark
 }
 
 func (a Aim) String() string {
@@ -32,14 +44,48 @@ func (a Aim) String() string {
 	return a.Element + " at " + pointText(a.Point)
 }
 
+// Mark is what the device had reported when the input went, for Reaction.
+func (a Aim) Mark() Mark {
+	return a.mark
+}
+
+// TapOptions are the options of TapElement.
+type TapOptions struct {
+	// Timeout is how long the tap waits for the element, as Tap takes it.
+	Timeout time.Duration
+	// Retry is a point a tap on the element already tried: the tap aims at the
+	// element's safest point instead (saferPoint), and gives up with
+	// ErrSamePoint, tapping nothing, when that is the same one.
+	Retry *Point
+	// Ready runs as the touch is about to go, once the element is aimed at.
+	Ready func(ctx context.Context)
+}
+
+// ErrSamePoint tells that an element has no safer point than the one a tap
+// already tried.
+var ErrSamePoint = E.New("the element has no safer point than the one tried")
+
 func (p *Phone) Tap(ctx context.Context, ref string, timeout time.Duration) (Aim, error) {
-	return p.aimed(ctx, ref, timeout, "tap", func(ctx context.Context, s *axSession, _ *PhoneNode, at Point) error {
+	return p.TapElement(ctx, ref, TapOptions{Timeout: timeout})
+}
+
+// TapElement taps the element once a tap at the point it answers would reach
+// it, as Tap does.
+func (p *Phone) TapElement(ctx context.Context, ref string, options TapOptions) (Aim, error) {
+	name := "tap"
+	if options.Retry != nil {
+		name = "tap.safer"
+	}
+	return p.aimed(ctx, ref, options.Timeout, name, options.Retry, func(ctx context.Context, s *axSession, _ *PhoneNode, at Point) error {
+		if options.Ready != nil {
+			options.Ready(ctx)
+		}
 		return s.tap(ctx, at, 1, 0)
 	})
 }
 
 func (p *Phone) SetText(ctx context.Context, ref, text string, timeout time.Duration) (Aim, error) {
-	return p.aimed(ctx, ref, timeout, "setText", func(ctx context.Context, s *axSession, node *PhoneNode, at Point) error {
+	return p.aimed(ctx, ref, timeout, "setText", nil, func(ctx context.Context, s *axSession, node *PhoneNode, at Point) error {
 		return s.setText(ctx, node, at, text)
 	})
 }
@@ -47,8 +93,9 @@ func (p *Phone) SetText(ctx context.Context, ref, text string, timeout time.Dura
 // aimed runs act on the element once a tap at the point it answers would reach
 // it, checking again while the element is moving, disabled or behind another
 // one, until the timeout, or for coverLimit while the application's own bars
-// cover it; a negative timeout waits forever and zero checks once.
-func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, name string, act func(ctx context.Context, s *axSession, node *PhoneNode, at Point) error) (Aim, error) {
+// cover it; a negative timeout waits forever and zero checks once. Given
+// retry, the point a tap tried before, it aims at the element's safest point.
+func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, name string, retry *Point, act func(ctx context.Context, s *axSession, node *PhoneNode, at Point) error) (Aim, error) {
 	c, ctx, done, err := p.begin(ctx)
 	if err != nil {
 		return Aim{}, err
@@ -67,7 +114,7 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 	pushes, unsubscribe := c.events.subscribe()
 	defer unsubscribe()
 	started := time.Now()
-	s := &axSession{phone: p, conn: c, geometry: geometry, grant: grant, settled: started.Add(animationLimit)}
+	s := &axSession{phone: p, conn: c, geometry: geometry, grant: grant, settled: started.Add(animationLimit), retry: retry}
 	var deadline time.Time
 	if timeout >= 0 {
 		deadline = started.Add(timeout)
@@ -142,13 +189,14 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 	if s.acted {
 		c.events.publish(Event{Kind: EventInput})
 		c.front.acted()
+		s.target.mark.conn, s.target.mark.screens = c, c.events.screen.Load()
 	}
 	return s.target, err
 }
 
 func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, error) {
 	name := describeElement(target.AX)
-	s.target = Aim{Element: name, Point: target.Point, Secure: target.AX.Secure()}
+	s.target = Aim{Element: name, Point: target.Point, Secure: target.AX.Secure(), Visible: target.Visible, Risky: riskyWord(target.AX)}
 	s.animating, s.stale, s.fixed, s.blocker = false, false, false, nil
 	if !target.HasFrame() {
 		return Point{}, "", E.New(name, " has no position on the screen; perform one of its actions instead")
@@ -168,6 +216,11 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 	}
 	s.stale = false
 	at := target.Point
+	if s.retry != nil {
+		if at = target.saferPoint(); math.Hypot(at.X-s.retry.X, at.Y-s.retry.Y) < saferDistance {
+			return Point{}, "", ErrSamePoint
+		}
+	}
 	batch := &accessibility.Batch{}
 	mapped := batch.Mapped(target.AX)
 	attributes := batch.Attributes(target.AX)
@@ -189,7 +242,11 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 		return Point{}, name + " is moving", nil
 	}
 	name = describeElement(attributes.Value)
-	s.target.Element, s.target.Secure = name, attributes.Value.Secure()
+	s.target.Element, s.target.Secure, s.target.Selected = name, attributes.Value.Secure(), attributes.Value.Selected
+	if risky := riskyWord(attributes.Value); risky != "" {
+		s.target.Risky = risky
+	}
+	s.target.mark = Mark{element: &attributes.Value, front: target.model.Root.AX.Ref.PID, generation: target.model.generation}
 	if animating.Code == 0 && animating.Value && time.Now().Before(s.settled) {
 		s.animating = true
 		return Point{}, name + " is animating", nil
