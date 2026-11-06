@@ -81,11 +81,15 @@ func (p *Phone) TapElement(ctx context.Context, ref string, options TapOptions) 
 	if options.Retry != nil {
 		name = "tap.safer"
 	}
-	return p.aimed(ctx, ref, options.Timeout, name, options.Retry, func(ctx context.Context, s *axSession, _ *PhoneNode, at Point) error {
+	return p.aimed(ctx, ref, options.Timeout, name, options.Retry, func(ctx context.Context, s *axSession, node *PhoneNode, at Point) error {
 		if options.Ready != nil {
 			options.Ready(ctx)
 		}
-		return s.tap(ctx, at, 1, 0)
+		if err := s.tap(ctx, at, 1, 0); err != nil {
+			return err
+		}
+		s.afterTouch(ctx, node, at)
+		return nil
 	})
 }
 
@@ -119,7 +123,7 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 	pushes, unsubscribe := c.events.subscribe()
 	defer unsubscribe()
 	started := time.Now()
-	s := &axSession{phone: p, conn: c, geometry: geometry, grant: grant, settled: started.Add(animationLimit), retry: retry}
+	s := &axSession{phone: p, conn: c, geometry: geometry, grant: grant, settled: started.Add(animationLimit), steadyUntil: started.Add(steadyLimit), retry: retry}
 	var deadline time.Time
 	if timeout >= 0 {
 		deadline = started.Add(timeout)
@@ -168,10 +172,13 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 		}
 		alerts = append(alerts, alerted(pushes)...)
 		delay = min(max(delay*2, pollFirst), pollLongest)
-		if s.animating {
+		switch {
+		case s.settling:
+			delay = steadyGap
+		case s.animating:
 			delay = pollFirst
 		}
-		if !s.animating && !deadline.IsZero() && time.Now().Add(delay).After(deadline) {
+		if !s.animating && !s.settling && !deadline.IsZero() && time.Now().Add(delay).After(deadline) {
 			if timeout == 0 {
 				return refuse(pending, "", ErrTimeout)
 			}
@@ -208,7 +215,7 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, error) {
 	name := describeElement(target.AX)
 	s.target = Aim{Element: name, Point: target.Point, Secure: target.AX.Secure(), Visible: target.Visible, Risky: riskyWord(target.AX), Doubt: target.doubt()}
-	s.animating, s.moved, s.stale, s.fixed, s.blocker = false, false, false, false, nil
+	s.animating, s.moved, s.settling, s.stale, s.fixed, s.blocker = false, false, false, false, false, nil
 	if !target.HasFrame() {
 		return Point{}, "", E.New(name, " has no position on the screen; perform one of its actions instead")
 	}
@@ -240,8 +247,8 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 	if err := s.client.Run(ctx, batch); err != nil {
 		return Point{}, "", err
 	}
-	previous := s.previous
-	s.previous = attributes.Value.Frame
+	previous, previousAt := s.previous, s.previousAt
+	s.previous, s.previousAt = attributes.Value.Frame, time.Now()
 	switch {
 	case mapped.Code == 0 && !mapped.Value:
 		return Point{}, name + " is gone", nil
@@ -249,9 +256,6 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 		return Point{}, name + " did not answer", nil
 	case !attributes.Value.Enabled:
 		return Point{}, name + " is disabled", nil
-	case previous != nil && !nearFrame(attributes.Value.Frame, previous):
-		s.moved = true
-		return Point{}, name + " is moving", nil
 	}
 	name = describeElement(attributes.Value)
 	s.target.Element, s.target.Secure, s.target.Selected = name, attributes.Value.Secure(), attributes.Value.Selected
@@ -263,16 +267,8 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 		s.animating = true
 		return Point{}, name + " is animating", nil
 	}
-	if fresh := attributes.Value.Frame; fresh != nil {
-		if rect := target.space.rect(*fresh); !rect.Empty() && !rect.Contains(at) {
-			at = rect.Center()
-			s.target.Doubt = "it moved since the screen was read"
-			again := &accessibility.Batch{}
-			hit = again.HitTest(s.geometry.digitizer(at))
-			if err := s.client.Run(ctx, again); err != nil {
-				return Point{}, "", err
-			}
-		}
+	if reason := s.steadiness(target, attributes.Value.Frame, previous, previousAt); reason != "" {
+		return Point{}, name + reason, nil
 	}
 	if hit.Code != 0 {
 		return Point{}, "the device does not tell which element is at " + pointText(at), nil

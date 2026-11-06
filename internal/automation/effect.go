@@ -21,14 +21,20 @@ type ScreenWatcher interface {
 type ScreenWatch interface {
 	// Mark takes the newest frame as the one later frames are compared with.
 	Mark(ctx context.Context) error
-	// Change waits for a frame after the mark that differs from it at target,
-	// in points, answering "target", or only elsewhere below the status bar,
-	// answering "elsewhere" once the target has had a moment to change too;
-	// it answers "" when no frame by until differs. after is the time from
-	// the mark to the changed frame.
+	// Change waits for a frame after the mark that differs from it, and
+	// answers where the change shows once it has held a moment: "target"
+	// when the frames still differ at target, in points, "elsewhere" when
+	// they differ only below the status bar elsewhere, and ChangeTransient
+	// when they went back to the mark's look. It answers "" when no frame by
+	// until differs. after is the time from the mark to the first changed
+	// frame.
 	Change(ctx context.Context, target device.Rect, until time.Time) (where string, after time.Duration, err error)
 	Close()
 }
+
+// ChangeTransient is what ScreenWatch.Change answers for a change that went
+// back, as a press highlight does.
+const ChangeTransient = "transient"
 
 const (
 	// The first changed frame of a tap reached the PC 105 ms after the touch
@@ -50,6 +56,7 @@ const (
 	effectTarget    = "target"
 	effectElsewhere = "elsewhere"
 	effectNone      = "none"
+	effectMoved     = "moved"
 )
 
 // effect is what an input changed, as a script sees it.
@@ -127,20 +134,27 @@ func (s *observer) ready(ctx context.Context) {
 }
 
 // effect tells what the input marked last changed at target and elsewhere:
-// the frames first, then what the device reports of the element and the
-// screen.
+// whether the element moved away from the touch as it went, then the frames,
+// then what the device reports of the element and the screen. A change that
+// went back, as a press highlight does, is no effect.
 func (s *observer) effect(ctx context.Context, mark device.Mark, target device.Rect) effect {
+	if displaced := mark.Displaced(); displaced != "" {
+		return effect{Where: effectMoved, Detail: displaced + ", so the touch most likely reached another element"}
+	}
 	until := s.touched.Add(effectWindow)
 	settle := until
+	transient := ""
 	if s.watch != nil {
 		where, after, err := s.watch.Change(ctx, target, until)
 		switch {
 		case err != nil:
 			s.call.engine.logger.Debug(E.Cause(err, "watch the screen after ", s.call.name))
 		case where == effectTarget:
-			return effect{Where: effectTarget, Detail: "the screen changed at it " + msText(after) + " after the touch"}
+			return effect{Where: effectTarget, Detail: "the screen changed at it " + msText(after) + " after the touch, and stayed changed"}
 		case where == effectElsewhere:
-			return effect{Where: effectElsewhere, Detail: "the screen changed away from it " + msText(after) + " after the touch"}
+			return effect{Where: effectElsewhere, Detail: "the screen changed away from it " + msText(after) + " after the touch, and stayed changed"}
+		case where == ChangeTransient:
+			transient = "the screen changed " + msText(after) + " after the touch and went back, as a press highlight does; "
 		}
 		settle = time.Now().Add(pushGrace)
 	}
@@ -149,10 +163,13 @@ func (s *observer) effect(ctx context.Context, mark device.Mark, target device.R
 		s.call.engine.logger.Debug(E.Cause(err, "read what ", s.call.name, " changed"))
 	}
 	if reaction.Where != "" {
-		return effect{Where: reaction.Where, Detail: reaction.Detail}
+		return effect{Where: reaction.Where, Detail: transient + reaction.Detail}
 	}
 	if s.watch == nil {
 		return effect{Where: effectNone, Detail: "the device reported no change within " + msText(time.Since(s.touched)) + ", without the live screen to watch"}
+	}
+	if transient != "" {
+		return effect{Where: effectNone, Detail: transient + "nothing else changed"}
 	}
 	return effect{Where: effectNone, Detail: "nothing changed on the screen within " + msText(effectWindow)}
 }

@@ -67,6 +67,7 @@ type foreground struct {
 
 	access    sync.Mutex
 	current   frontApplication
+	arrived   time.Time
 	frontmost uint64
 	tracked   bool
 	pushing   bool
@@ -357,6 +358,7 @@ func (f *foreground) saw(front frontApplication) frontApplication {
 	if !changed {
 		return front
 	}
+	f.arrived = front.at
 	f.conn.connection.trace(front.at, "foreground", front.bundleID+" pid "+strconv.FormatUint(pid, 10)+" via "+front.via, time.Since(front.at))
 	app := ForegroundApp{BundleID: front.bundleID, PID: pid, At: front.at}
 	f.conn.events.publish(Event{Kind: EventForeground, PID: app.PID, BundleID: app.BundleID})
@@ -838,4 +840,15 @@ func (p *Phone) WatchApps(ctx context.Context, emit func(AppEvent)) error {
 			return err
 		}
 	}
+}
+
+// arrival is when the application came to the front, as far as the device
+// told, or zero when another one is in front.
+func (f *foreground) arrival(pid uint64) time.Time {
+	f.access.Lock()
+	defer f.access.Unlock()
+	if f.current.pid != pid {
+		return time.Time{}
+	}
+	return f.arrived
 }
