@@ -631,6 +631,7 @@ declare module "@swipt/api/device" {
 
 declare module "@swipt/api/screen" {
   import type { CallOptions, ObservableState, Point, Rect } from "@swipt/api";
+  import type { AccessibilityElement } from "@swipt/api/accessibility";
   import type { FileHandle } from "@swipt/api/file-system";
   import type { ImageDifference, RasterImage } from "@swipt/api/image";
 
@@ -764,11 +765,43 @@ declare module "@swipt/api/screen" {
     readonly image: RasterImage;
   }
 
+  /** "accessibility": an element's label or value; "text": text read off the live frame; "lightText": text read off the frame with only its near-white pixels kept, as white labels on wallpapers. */
+  export type LocateSource = "accessibility" | "text" | "lightText";
+
+  export interface LocateOptions extends CallOptions {
+    /** The lowest score answered; 0.75 when omitted. */
+    readonly threshold?: number;
+    readonly region?: Rect;
+    readonly languages?: readonly string[];
+  }
+
+  export interface Located {
+    /** The text that matched. */
+    readonly text: string;
+    readonly frame: Rect;
+    /** Where a tap reaches the target: an element's point, the text's center, or on the Home Screen the icon above its label. */
+    readonly point: Point;
+    /** From 0 to 1: how closely the text matches, less for text a hit test did not confirm and for the light-text pass. */
+    readonly score: number;
+    readonly source: LocateSource;
+    /** The element came from accessibility, or a hit test at the point reached an element with this text. */
+    readonly confirmed: boolean;
+    readonly element?: AccessibilityElement;
+  }
+
   export function screenshot(options?: CallOptions): Promise<RasterImage>;
   export function find(
     target: ScreenTarget | readonly ScreenTarget[],
     options?: ScreenFindOptions,
   ): Promise<ScreenMatch | null>;
+  /**
+   * Finds text where a tap reaches it: an element of the front app whose label or value is the text (case, spaces and punctuation aside), else the text read off the live frame, matched loosely, read again with only near-white pixels kept when the first reading misses it.
+   * Text read off the frame is confirmed with a hit test; on the Home Screen a label leads to its icon. Answers null when nothing scores the threshold. Tap the answer with input.tap(located.point, { verify: true }).
+   */
+  export function locate(
+    target: string | RegExp,
+    options?: LocateOptions,
+  ): Promise<Located | null>;
   export const frames: ObservableState<RasterImage>;
   export function waitFor(
     predicate: (frame: RasterImage) => boolean | Promise<boolean>,
