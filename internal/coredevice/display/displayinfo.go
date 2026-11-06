@@ -78,6 +78,11 @@ func primaryBacklightState(output map[string]any) (string, error) {
 	// or a display it has no backlight of (DDI 27B5028f CoreDeviceUtilities
 	// 0x37298c, 0x35aecc, 0x372bbc).
 	state, _ := selected["backlightState"].(string)
+	if state == "" {
+		// iOS 27.0 reports the aggregate state only (iPhone18,2, iOS 27.0.1
+		// 24A446).
+		state, _ = output["backlightState"].(string)
+	}
 	switch state {
 	case "off", "inactiveOn", "activeOn":
 		return state, nil
