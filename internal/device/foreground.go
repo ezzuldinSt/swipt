@@ -22,8 +22,14 @@ const (
 	appStatesBacklog = 250 * time.Millisecond
 	recentFront      = 250 * time.Millisecond
 	frontBurst       = 1200 * time.Millisecond
-	trackingLinger   = 10 * time.Second
 	frontProbe       = 3 * time.Second
+)
+
+// Tracking, once started, lasts as long as the connection, and a lost app
+// state connection is made again.
+const (
+	appStatesRetryFirst   = time.Second
+	appStatesRetryLongest = 30 * time.Second
 )
 
 // AXP notification 3, which the translator forwards at once for a change of
@@ -58,11 +64,12 @@ type foreground struct {
 	current   frontApplication
 	frontmost uint64
 	tracked   bool
+	pushing   bool
+	actedAt   time.Time
 	listeners map[int]func(ForegroundApp)
 	next      int
 	stop      context.CancelFunc
 	stopped   chan struct{}
-	linger    *time.Timer
 	until     time.Time
 	pending   uint64
 	kick      chan struct{}
@@ -72,20 +79,26 @@ type foreground struct {
 
 	infoAccess sync.Mutex
 	info       *instruments.DeviceInfo
+
+	tracker func(ctx context.Context, stopped chan struct{})
 }
 
 func newForeground(c *conn) *foreground {
-	return &foreground{
+	f := &foreground{
 		conn: c, listeners: make(map[int]func(ForegroundApp)), kick: make(chan struct{}, 1), paths: make(map[uint64]string),
 		probes: make(map[uint64]time.Time),
 	}
+	f.tracker = f.track
+	return f
 }
 
+// get answers the app in front, reading it again when what is known of it was
+// seen before the last action, which may have changed it.
 func (f *foreground) get(ctx context.Context) (frontApplication, error) {
 	f.access.Lock()
-	current, tracked := f.current, f.tracked
+	current, tracked, acted := f.current, f.tracked, f.actedAt
 	f.access.Unlock()
-	if tracked && current.bundleID != "" || time.Since(current.at) < recentFront {
+	if !current.at.Before(acted) && (tracked && current.bundleID != "" || time.Since(current.at) < recentFront) {
 		return current, nil
 	}
 	return f.read(ctx)
@@ -330,35 +343,18 @@ func (f *foreground) watch(listener func(ForegroundApp)) (cancel func()) {
 	f.next++
 	id := f.next
 	f.listeners[id] = listener
-	if f.linger != nil {
-		f.linger.Stop()
-		f.linger = nil
-	}
 	if f.stop == nil {
 		ctx, stop := context.WithCancel(f.conn.ctx)
 		f.stop, f.stopped = stop, make(chan struct{})
-		go f.track(ctx, f.stopped)
+		go f.tracker(ctx, f.stopped)
 	}
 	f.access.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			f.access.Lock()
-			defer f.access.Unlock()
 			delete(f.listeners, id)
-			if len(f.listeners) > 0 || f.stop == nil {
-				return
-			}
-			var linger *time.Timer
-			linger = time.AfterFunc(trackingLinger, func() {
-				f.access.Lock()
-				defer f.access.Unlock()
-				if f.linger == linger && len(f.listeners) == 0 && f.stop != nil {
-					f.stop()
-					f.stop, f.tracked, f.linger = nil, false, nil
-				}
-			})
-			f.linger = linger
+			f.access.Unlock()
 		})
 	}
 }
@@ -375,13 +371,16 @@ func (f *foreground) trigger(window time.Duration) {
 	}
 }
 
+// acted notes an action, after which the app in front is read again before it
+// is answered, and read at once for those watching it.
 func (f *foreground) acted() {
 	f.access.Lock()
-	if !f.tracked {
-		f.current.at = time.Time{}
-	}
+	f.actedAt = time.Now()
+	watched := len(f.listeners) > 0
 	f.access.Unlock()
-	f.trigger(frontBurst)
+	if watched {
+		f.trigger(frontBurst)
+	}
 }
 
 func (f *foreground) pushed(push accessibility.Push) {
@@ -408,19 +407,36 @@ func (f *foreground) track(ctx context.Context, stopped chan struct{}) {
 	if err := f.loadBundles(ctx); err != nil && ctx.Err() == nil {
 		f.conn.logger.Debug(E.Cause(err, "list apps"))
 	}
+	var states *instruments.AppStates
 	var pushes <-chan instruments.AppState
 	var pushesDone <-chan struct{}
-	states, err := instruments.DialAppStates(ctx, ctx, f.conn.device)
-	if err != nil {
-		if ctx.Err() != nil {
+	var redial <-chan time.Time
+	var backlog time.Time
+	retry := appStatesRetryFirst
+	dial := func() {
+		var err error
+		states, err = instruments.DialAppStates(ctx, ctx, f.conn.device)
+		if err != nil {
+			states = nil
+			if ctx.Err() == nil {
+				f.conn.logger.Debug(E.Cause(err, "watch app states"))
+				redial = time.After(retry)
+				retry = min(retry*2, appStatesRetryLongest)
+			}
 			return
 		}
-		f.conn.logger.Debug(E.Cause(err, "watch app states"))
-	} else {
-		defer states.Close()
-		pushes, pushesDone = states.States(), states.Done()
+		pushes, pushesDone, redial = states.States(), states.Done(), nil
+		backlog = time.Now().Add(appStatesBacklog)
+		f.access.Lock()
+		f.pushing = true
+		f.access.Unlock()
 	}
-	backlog := time.Now().Add(appStatesBacklog)
+	dial()
+	defer func() {
+		if states != nil {
+			states.Close()
+		}
+	}()
 	confirm := time.NewTimer(time.Hour)
 	confirm.Stop()
 	defer confirm.Stop()
@@ -461,7 +477,18 @@ func (f *foreground) track(ctx context.Context, stopped chan struct{}) {
 			continue
 		case <-pushesDone:
 			f.conn.logger.Debug("watch app states: ", states.Err())
-			pushes, pushesDone = nil, nil
+			states.Close()
+			states, pushes, pushesDone = nil, nil, nil
+			f.access.Lock()
+			f.pushing, f.tracked = false, false
+			f.access.Unlock()
+			retry = appStatesRetryFirst
+			redial = time.After(retry)
+			continue
+		case <-redial:
+			if dial(); states != nil {
+				f.trigger(0)
+			}
 			continue
 		case <-f.kick:
 			delay = 0
@@ -508,9 +535,11 @@ func (f *foreground) confirm(ctx context.Context, pushed uint64) {
 	f.markTracked()
 }
 
+// markTracked trusts the app in front from then on, as the app state pushes
+// keep it current.
 func (f *foreground) markTracked() {
 	f.access.Lock()
-	f.tracked = f.stop != nil
+	f.tracked = f.stop != nil && f.pushing
 	f.access.Unlock()
 }
 
@@ -600,10 +629,6 @@ func (f *foreground) close() {
 	f.access.Lock()
 	stop, stopped := f.stop, f.stopped
 	f.stop = nil
-	if f.linger != nil {
-		f.linger.Stop()
-		f.linger = nil
-	}
 	f.access.Unlock()
 	if stop != nil {
 		stop()
