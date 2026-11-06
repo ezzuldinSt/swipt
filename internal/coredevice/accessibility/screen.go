@@ -17,6 +17,9 @@ type Screen struct {
 	System   *TreeNode
 	Focused  *ElementRef
 	Rounds   []time.Duration
+	// Animating is set when the application ran UIView animations as it was
+	// read, or did not say, so that frames may be between two places.
+	Animating bool
 }
 
 const (
@@ -75,6 +78,7 @@ func (c *RemoteClient) ReadScreen(ctx context.Context, springboard uint64, depth
 		full := second.Snapshot(app, SnapshotOptions{Depth: depth})
 		modal := second.Snapshot(app, SnapshotOptions{Attributes: []int64{nativeClassName}, Depth: depth, HonorModal: true})
 		focused := second.Focused(app)
+		animating := second.AnimationsInProgress(app)
 		var systemSnapshot *Result[*Snapshot]
 		if system.Value.Ref.PID != app.Ref.PID && (overlay == nil || overlay(app)) {
 			systemSnapshot = second.Snapshot(system.Value, SnapshotOptions{Depth: depth})
@@ -91,7 +95,7 @@ func (c *RemoteClient) ReadScreen(ctx context.Context, springboard uint64, depth
 		if err := modal.Err("snapshot the frontmost application's modal view"); err != nil {
 			return nil, err
 		}
-		screen := &Screen{BundleID: bundle.Value, App: app, Root: full.Value.Root}
+		screen := &Screen{BundleID: bundle.Value, App: app, Root: full.Value.Root, Animating: animating.Code != 0 || animating.Value}
 		if focused.Code == 0 {
 			ref := focused.Value.Ref
 			screen.Focused = &ref
@@ -147,6 +151,18 @@ type ApplicationOptions struct {
 	Focused    bool
 	Expand     bool
 	Wanted     func(bundleID string) bool
+	// Animations reads whether the application runs UIView animations.
+	Animations bool
+	// Front, with PID 0, is the application last read as the frontmost one:
+	// it is read with the frontmost application in one round, kept only when
+	// that is still it.
+	Front *Front
+}
+
+// Front is an application read as the frontmost one, and its bundle ID.
+type Front struct {
+	App      Element
+	BundleID string
 }
 
 var ErrGone = E.New("accessibility: the element is gone")
@@ -156,102 +172,177 @@ var ErrGone = E.New("accessibility: the element is gone")
 // SpringBoard (iPhone18,2, iOS 27.2 24B115).
 func (c *RemoteClient) ReadApplication(ctx context.Context, options ApplicationOptions) (*Screen, error) {
 	read := func() (*Screen, error) {
-		first := &Batch{}
-		var app *Result[Element]
-		switch {
-		case options.Root != nil:
-			app = first.Application(options.Root.Ref.PID)
-		case options.PID == 0:
-			app = first.Frontmost()
-		default:
-			app = first.Application(options.PID)
-		}
-		if err := c.Run(ctx, first); err != nil {
-			return nil, err
-		}
-		if err := app.Err("read the application"); err != nil {
-			if options.Root != nil {
-				return nil, E.Extend(ErrGone, "read the screen again; its process ", options.Root.Ref.PID, " has no application: ", err)
+		var app *Element
+		if guess := options.Front; options.PID == 0 && options.Root == nil && guess != nil && !c.guessMissed.Load() {
+			screen, front, err := c.readGuessed(ctx, options, guess)
+			if err != nil || screen != nil {
+				return screen, err
 			}
-			return nil, err
+			app = front
 		}
-		named := options.PID != 0 || options.Root != nil
+		if app == nil {
+			first := &Batch{}
+			var found *Result[Element]
+			switch {
+			case options.Root != nil:
+				found = first.Application(options.Root.Ref.PID)
+			case options.PID == 0:
+				found = first.Frontmost()
+			default:
+				found = first.Application(options.PID)
+			}
+			if err := c.Run(ctx, first); err != nil {
+				return nil, err
+			}
+			if err := found.Err("read the application"); err != nil {
+				if options.Root != nil {
+					return nil, E.Extend(ErrGone, "read the screen again; its process ", options.Root.Ref.PID, " has no application: ", err)
+				}
+				return nil, err
+			}
+			app = &found.Value
+		}
 		var bundle *Result[string]
 		if options.Wanted != nil {
 			check := &Batch{}
-			bundle = check.BundleID(app.Value)
+			bundle = check.BundleID(*app)
 			if err := c.Run(ctx, check); err != nil {
 				return nil, err
 			}
 			if err := bundle.Err("read the application's bundle ID"); err != nil {
-				return nil, c.silent(ctx, app.Value, named, err)
+				return nil, c.silent(ctx, *app, options.named(), err)
 			}
 			if !options.Wanted(bundle.Value) {
-				return &Screen{BundleID: bundle.Value, App: app.Value}, nil
+				return &Screen{BundleID: bundle.Value, App: *app}, nil
 			}
 		}
-		attributes := options.Attributes
-		if options.Expand && len(attributes) > 0 && !slices.Contains(attributes, nativeClassName) {
-			attributes = append(slices.Clone(attributes), nativeClassName)
-		}
-		root := app.Value
-		if options.Root != nil {
-			root = *options.Root
-		}
 		second := &Batch{}
-		if bundle == nil {
-			bundle = second.BundleID(app.Value)
-		}
-		full := second.Snapshot(root, SnapshotOptions{Attributes: attributes, Depth: options.Depth, Clip: options.Clip})
-		var modal *Result[*Snapshot]
-		if options.Modal {
-			modal = second.Snapshot(root, SnapshotOptions{Attributes: []int64{nativeClassName}, Depth: options.Depth, HonorModal: true})
-		}
-		var focused *Result[Element]
-		if options.Focused {
-			focused = second.Focused(app.Value)
-		}
+		reads := addApplicationReads(second, *app, options, bundle)
 		if err := c.Run(ctx, second); err != nil {
 			return nil, err
 		}
-		if err := bundle.Err("read the application's bundle ID"); err != nil {
-			return nil, c.silent(ctx, app.Value, named, err)
-		}
-		if options.Root != nil {
-			switch {
-			case full.Code != 0:
-				return nil, E.Extend(ErrGone, "read the screen again; the snapshot of it, element ", options.Root.Ref.PID, ":", options.Root.Ref.ObjectID,
-					", failed: ", full.Err("snapshot the element"))
-			case full.Value.Root.Ref != options.Root.Ref:
-				return nil, E.Extend(ErrGone, "read the screen again; the snapshot of it, element ", options.Root.Ref.PID, ":", options.Root.Ref.ObjectID,
-					", answered element ", full.Value.Root.Ref.PID, ":", full.Value.Root.Ref.ObjectID)
-			}
-		} else if err := full.Err("snapshot the application"); err != nil {
-			return nil, c.silent(ctx, app.Value, named, err)
-		}
-		screen := &Screen{BundleID: bundle.Value, App: app.Value, Root: full.Value.Root}
-		if modal != nil {
-			if err := modal.Err("snapshot the application's modal view"); err != nil {
-				return nil, err
-			}
-			markInert(full.Value.Root, modal.Value.Listed, false)
-		}
-		if focused != nil && focused.Code == 0 {
-			ref := focused.Value.Ref
-			screen.Focused = &ref
-		}
-		if options.Expand {
-			run := func(batch *Batch) error { return c.Run(ctx, batch) }
-			if err := c.expand(run, []*Snapshot{full.Value}, 0, options.Depth); err != nil {
-				return nil, err
-			}
-		}
-		return screen, nil
+		return c.applicationScreen(ctx, *app, options, reads)
 	}
-	if options.PID != 0 || options.Root != nil {
+	if options.named() {
 		return read()
 	}
 	return untilAnswered(read)
+}
+
+// named reports whether the options name the application to read, rather
+// than taking the frontmost one.
+func (o ApplicationOptions) named() bool {
+	return o.PID != 0 || o.Root != nil
+}
+
+// readGuessed reads the frontmost application and, in the same round, the
+// application guessed to be it. axauditd answers a round's requests in order
+// (see exchange), so the guessed one's tree is kept only when the frontmost
+// application, read first, is the guessed one; otherwise it answers that
+// application to read instead. SpringBoard's tree with labels came in 192 to
+// 224 ms that way, and in 257 to 524 ms in two rounds; its application
+// element kept its object ID across reads (iPhone18,2, iOS 27.0.1 24A446 over
+// Wi-Fi).
+func (c *RemoteClient) readGuessed(ctx context.Context, options ApplicationOptions, guess *Front) (*Screen, *Element, error) {
+	batch := &Batch{}
+	front := batch.Frontmost()
+	wanted := options.Wanted == nil || options.Wanted(guess.BundleID)
+	var reads *applicationReads
+	if wanted {
+		reads = addApplicationReads(batch, guess.App, options, nil)
+	}
+	if err := c.Run(ctx, batch); err != nil {
+		return nil, nil, err
+	}
+	if err := front.Err("read the application"); err != nil {
+		return nil, nil, err
+	}
+	if !front.Value.object.same(guess.App.object) {
+		if front.Value.Ref.PID == guess.App.Ref.PID {
+			// The same application under another object: guesses would keep
+			// missing on this connection.
+			c.guessMissed.Store(true)
+		}
+		return nil, &front.Value, nil
+	}
+	if !wanted {
+		return &Screen{BundleID: guess.BundleID, App: front.Value}, nil, nil
+	}
+	screen, err := c.applicationScreen(ctx, front.Value, options, reads)
+	return screen, nil, err
+}
+
+type applicationReads struct {
+	bundle    *Result[string]
+	full      *Result[*Snapshot]
+	modal     *Result[*Snapshot]
+	focused   *Result[Element]
+	animating *Result[bool]
+}
+
+func addApplicationReads(batch *Batch, app Element, options ApplicationOptions, bundle *Result[string]) *applicationReads {
+	attributes := options.Attributes
+	if options.Expand && len(attributes) > 0 && !slices.Contains(attributes, nativeClassName) {
+		attributes = append(slices.Clone(attributes), nativeClassName)
+	}
+	root := app
+	if options.Root != nil {
+		root = *options.Root
+	}
+	reads := &applicationReads{bundle: bundle}
+	if reads.bundle == nil {
+		reads.bundle = batch.BundleID(app)
+	}
+	reads.full = batch.Snapshot(root, SnapshotOptions{Attributes: attributes, Depth: options.Depth, Clip: options.Clip})
+	if options.Modal {
+		reads.modal = batch.Snapshot(root, SnapshotOptions{Attributes: []int64{nativeClassName}, Depth: options.Depth, HonorModal: true})
+	}
+	if options.Focused {
+		reads.focused = batch.Focused(app)
+	}
+	if options.Animations {
+		reads.animating = batch.AnimationsInProgress(app)
+	}
+	return reads
+}
+
+func (c *RemoteClient) applicationScreen(ctx context.Context, app Element, options ApplicationOptions, reads *applicationReads) (*Screen, error) {
+	if err := reads.bundle.Err("read the application's bundle ID"); err != nil {
+		return nil, c.silent(ctx, app, options.named(), err)
+	}
+	if options.Root != nil {
+		switch {
+		case reads.full.Code != 0:
+			return nil, E.Extend(ErrGone, "read the screen again; the snapshot of it, element ", options.Root.Ref.PID, ":", options.Root.Ref.ObjectID,
+				", failed: ", reads.full.Err("snapshot the element"))
+		case reads.full.Value.Root.Ref != options.Root.Ref:
+			return nil, E.Extend(ErrGone, "read the screen again; the snapshot of it, element ", options.Root.Ref.PID, ":", options.Root.Ref.ObjectID,
+				", answered element ", reads.full.Value.Root.Ref.PID, ":", reads.full.Value.Root.Ref.ObjectID)
+		}
+	} else if err := reads.full.Err("snapshot the application"); err != nil {
+		return nil, c.silent(ctx, app, options.named(), err)
+	}
+	screen := &Screen{BundleID: reads.bundle.Value, App: app, Root: reads.full.Value.Root}
+	if reads.modal != nil {
+		if err := reads.modal.Err("snapshot the application's modal view"); err != nil {
+			return nil, err
+		}
+		markInert(reads.full.Value.Root, reads.modal.Value.Listed, false)
+	}
+	if reads.focused != nil && reads.focused.Code == 0 {
+		ref := reads.focused.Value.Ref
+		screen.Focused = &ref
+	}
+	if reads.animating != nil {
+		screen.Animating = reads.animating.Code != 0 || reads.animating.Value
+	}
+	if options.Expand {
+		run := func(batch *Batch) error { return c.Run(ctx, batch) }
+		if err := c.expand(run, []*Snapshot{reads.full.Value}, 0, options.Depth); err != nil {
+			return nil, err
+		}
+	}
+	return screen, nil
 }
 
 type SilentFrontmostError struct {

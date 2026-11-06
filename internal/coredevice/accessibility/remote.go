@@ -6,6 +6,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -115,6 +116,7 @@ type RemoteClient struct {
 	pending                 []*pendingRead
 	drained                 chan struct{}
 	batchRawElementDisabled bool
+	guessMissed             atomic.Bool
 	screenViewing           []translationObject
 	screenViewingPending    chan struct{}
 	pushed                  func(Push)
