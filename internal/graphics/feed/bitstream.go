@@ -156,6 +156,21 @@ func (s *shortTermRPS) used() int {
 	return count
 }
 
+// usedDelta is the POC delta of the first picture the current one may use, 0 for none.
+func (s *shortTermRPS) usedDelta() int32 {
+	for index, used := range s.usedNegative {
+		if used {
+			return s.negative[index]
+		}
+	}
+	for index, used := range s.usedPositive {
+		if used {
+			return s.positive[index]
+		}
+	}
+	return 0
+}
+
 // spsInfo is the part of an SPS that colors and slice headers need.
 type spsInfo struct {
 	id                           uint32

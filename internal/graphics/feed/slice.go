@@ -125,8 +125,12 @@ type sliceHeader struct {
 	temporalMVP bool
 	references  int
 	weighted    bool
-	sps         *spsInfo
-	pps         *ppsInfo
+	// pocLSB is slice_pic_order_cnt_lsb, 0 for an IDR picture; reference is the POC delta of
+	// the one picture the slice may predict from, 0 unless it uses exactly one, a short-term one.
+	pocLSB    int
+	reference int32
+	sps       *spsInfo
+	pps       *ppsInfo
 }
 
 // skipPredictionWeights reads past pred_weight_table() (7.3.6.3) of a single-layer stream,
@@ -247,7 +251,7 @@ func readSliceHeader(r *nalReader, kind int, spsByID map[uint32]*spsInfo, ppsByI
 	temporalMVP := false
 	current := 0
 	if kind != 19 && kind != 20 { // IDR_W_RADL, IDR_N_LP
-		r.skip(s.log2MaxPOC)
+		h.pocLSB = int(r.bits(s.log2MaxPOC))
 		var set shortTermRPS
 		if !r.flag() { // short_term_ref_pic_set_sps_flag
 			set = readShortTermRPS(r, len(s.rps), len(s.rps), s.rps)
@@ -262,12 +266,17 @@ func readSliceHeader(r *nalReader, kind int, spsByID map[uint32]*spsInfo, ppsByI
 			set = s.rps[index]
 		}
 		current = set.used()
+		longTerm := 0
 		if s.longTerm {
 			used, ok := readLongTermPictures(r, s)
 			if !ok {
 				return h, false
 			}
+			longTerm = used
 			current += used
+		}
+		if current == 1 && longTerm == 0 {
+			h.reference = set.usedDelta()
 		}
 		if s.temporalMVP {
 			temporalMVP = r.flag()
