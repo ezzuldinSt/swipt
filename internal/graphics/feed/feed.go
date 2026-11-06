@@ -88,9 +88,11 @@ type Stats struct {
 	// Answering the time from the first packet to that frame's RGBA.
 	Decoding, Converting, Answering Timing
 	// Units and UnitBytes count the access units and their bytes; CodedUnits,
-	// SkippedUnits and UnreadUnits count them by UnitInfo.Skip; LastUnit is the newest.
+	// SkippedUnits and UnreadUnits count them by UnitInfo.Skip, and RepeatedUnits the ones
+	// that repeat their picture; LastUnit is the newest.
 	Units, UnitBytes                      int64
 	CodedUnits, SkippedUnits, UnreadUnits int64
+	RepeatedUnits                         int64
 	LastUnit                              UnitInfo
 }
 
@@ -139,10 +141,10 @@ type Feed struct {
 	decoding, converting, answering               timing
 	// The running unit counts, which the decoding goroutine adds to, and the counts at the
 	// last decoded frame, under access.
-	units, unitBytes, changedAt atomic.Int64
-	coded, skipped, unread      atomic.Int64
-	lastUnit                    atomic.Pointer[UnitInfo]
-	framedTotals                unitTotals
+	units, unitBytes, changedAt, movedAt atomic.Int64
+	coded, skipped, unread, repeated     atomic.Int64
+	lastUnit                             atomic.Pointer[UnitInfo]
+	framedTotals                         unitTotals
 	// observeDecoded, when set before the first Acquire, sees the arrival of every decoded
 	// frame and when it was decoded, in milliseconds since the epoch.
 	observeDecoded func(arrival, decoded float64)
@@ -248,6 +250,7 @@ func (f *Feed) Stats() Stats {
 	stats.Decoding, stats.Converting, stats.Answering = f.decoding.read(), f.converting.read(), f.answering.read()
 	stats.Units, stats.UnitBytes = f.units.Load(), f.unitBytes.Load()
 	stats.CodedUnits, stats.SkippedUnits, stats.UnreadUnits = f.coded.Load(), f.skipped.Load(), f.unread.Load()
+	stats.RepeatedUnits = f.repeated.Load()
 	if last := f.lastUnit.Load(); last != nil {
 		stats.LastUnit = *last
 	}
@@ -516,6 +519,9 @@ type Lease struct {
 	answered       FrameInfo
 	answeredTotals unitTotals
 	since          Changes
+	// repeated is set when the units since the frame answered before tell that the last one
+	// repeats it.
+	repeated bool
 }
 
 var _ raster.Feed = (*Lease)(nil)
@@ -559,12 +565,22 @@ func (l *Lease) answer(ctx context.Context, answered *frame, sequence int64) (*r
 	l.sequence = max(l.sequence, sequence)
 	if l.hasAnswered {
 		l.since = answered.totals.since(l.answeredTotals)
+		l.repeated = l.since.Repeats
 	} else {
 		l.since = answered.info.SincePrevious
+		l.repeated = false
 	}
 	l.hasAnswered, l.answered, l.answeredTotals = true, answered.info, answered.totals
 	l.access.Unlock()
 	return answered.image(ctx)
+}
+
+// Repeated tells whether the units since the frame the lease answered before the last one tell
+// that the last one repeats it pixel for pixel (raster.RepeatTeller).
+func (l *Lease) Repeated() bool {
+	l.access.Lock()
+	defer l.access.Unlock()
+	return l.repeated
 }
 
 // Answered is what the feed knows of the frame the lease answered last, and the units since

@@ -216,6 +216,9 @@ type skipWalker struct {
 	currentTs    int
 	// coded is where the walk met the first coding unit that is not skipped.
 	coded [2]int
+	// offsets is set when the slice walked last gave a CTB sample adaptive offsets, which change
+	// its pixels even where every unit is skipped.
+	offsets bool
 }
 
 // prepare makes the scan tables of the parameter sets; false when the tiles do not fit.
@@ -314,6 +317,7 @@ func (w *skipWalker) walk(r *nalReader, h sliceHeader) walkResult {
 		return walkUnknown
 	}
 	w.h = h
+	w.offsets = false
 	p := h.pps
 	initType := 1
 	if h.kind == sliceB {
@@ -441,6 +445,7 @@ func (w *skipWalker) sao(x, y, rs, ts int) {
 		if kind == 0 {
 			continue
 		}
+		w.offsets = true
 		depth := s.bitDepthLuma
 		if component > 0 {
 			depth = s.bitDepthChroma

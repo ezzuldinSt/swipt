@@ -43,20 +43,29 @@ type UnitInfo struct {
 	// still move blocks or copy from an older picture.
 	TemporalMVP bool
 	References  int
+	// Repeats is set when the unit's picture is the one before it, sample for sample: every
+	// coding unit is skipped in P slices that predict from the picture before only, without
+	// temporal motion vectors, weights or sample adaptive offsets. Merging then only finds zero
+	// motion vectors, nothing is deblocked, and the picture copies its reference.
+	Repeats bool
 }
 
 // Changed tells whether the unit may change the picture: it codes something, it weights its
 // references, or it could not be read. A unit whose coding units are all skipped can still
 // move blocks by the motion vectors they merge, as x265 moves a square across the test
-// fixture with skipped slices, so unchanged means nothing was coded, not that nothing moved.
+// fixture with skipped slices, so unchanged means nothing was coded, not that nothing moved;
+// Repeats tells that nothing moved either.
 func (u UnitInfo) Changed() bool {
 	return u.Skip != SkipAll || u.Weighted
 }
 
-// Changes sums access units: how many, their bytes, and whether any may change the picture.
+// Changes sums access units: how many, their bytes, whether any may change the picture, and
+// whether all of them repeat the picture before them, so the last one's picture is the one
+// before the first.
 type Changes struct {
 	Units, Bytes int64
 	Changed      bool
+	Repeats      bool
 }
 
 // FrameInfo is what the feed knows of a decoded frame.
@@ -73,14 +82,15 @@ type FrameInfo struct {
 }
 
 // unitTotals are a feed's running counts at an access unit: units and bytes up to and
-// including it, and the count at the last unit that may change the picture.
+// including it, and the counts at the last unit that may change the picture and at the last
+// one that does not repeat it.
 type unitTotals struct {
-	units, bytes, changedAt int64
+	units, bytes, changedAt, movedAt int64
 }
 
 // since sums the units after earlier, up to and including these.
 func (t unitTotals) since(earlier unitTotals) Changes {
-	return Changes{Units: t.units - earlier.units, Bytes: t.bytes - earlier.bytes, Changed: t.changedAt > earlier.units}
+	return Changes{Units: t.units - earlier.units, Bytes: t.bytes - earlier.bytes, Changed: t.changedAt > earlier.units, Repeats: t.movedAt <= earlier.units}
 }
 
 // count reads a unit and adds it to the feed's running counts, on the decoding goroutine; the
@@ -97,19 +107,29 @@ func (f *Feed) count(inspector *unitInspector, unit *AccessUnit, first bool) {
 	default:
 		f.unread.Add(1)
 	}
+	if unit.Info.Repeats {
+		f.repeated.Add(1)
+	}
 	if first || unit.Info.Changed() {
 		f.changedAt.Store(units)
 	}
-	unit.totals = unitTotals{units: units, bytes: bytes, changedAt: f.changedAt.Load()}
+	if first || !unit.Info.Repeats {
+		f.movedAt.Store(units)
+	}
+	unit.totals = unitTotals{units: units, bytes: bytes, changedAt: f.changedAt.Load(), movedAt: f.movedAt.Load()}
 	info := unit.Info
 	f.lastUnit.Store(&info)
 }
 
-// unitInspector reads the parameter sets and slices of a stream's units.
+// unitInspector reads the parameter sets and slices of a stream's units, and keeps the picture
+// order count of the last one.
 type unitInspector struct {
 	sps    map[uint32]*spsInfo
 	pps    map[uint32]*ppsInfo
 	walker skipWalker
+	// previousPOC is the slice_pic_order_cnt_lsb of the unit before, while hasPrevious.
+	previousPOC int
+	hasPrevious bool
 }
 
 func newUnitInspector() *unitInspector {
@@ -121,6 +141,9 @@ func newUnitInspector() *unitInspector {
 func (i *unitInspector) inspect(unit *AccessUnit) UnitInfo {
 	var info UnitInfo
 	found, coded, unknown, qp := false, false, unit.Damaged, false
+	// repeats holds while every slice read predicts from the unit before only, plainly.
+	repeats := i.hasPrevious
+	poc, hasPOC := 0, false
 	for _, nal := range unit.NALs {
 		info.Bytes += len(nal)
 		if len(nal) < 3 {
@@ -160,6 +183,12 @@ func (i *unitInspector) inspect(unit *AccessUnit) UnitInfo {
 			info.Weighted = info.Weighted || header.weighted
 			info.TemporalMVP = info.TemporalMVP || header.temporalMVP
 			info.References = max(info.References, header.references)
+			if !hasPOC {
+				poc, hasPOC = header.pocLSB, true
+			}
+			maxPOC := 1 << header.sps.log2MaxPOC
+			repeats = repeats && header.kind == sliceP && header.references == 1 && !header.temporalMVP && !header.weighted &&
+				header.reference < 0 && ((header.pocLSB+int(header.reference))%maxPOC+maxPOC)%maxPOC == i.previousPOC
 			if coded || unknown {
 				continue
 			}
@@ -169,6 +198,7 @@ func (i *unitInspector) inspect(unit *AccessUnit) UnitInfo {
 			case walkUnknown:
 				unknown = true
 			}
+			repeats = repeats && !i.walker.offsets
 		}
 	}
 	switch {
@@ -177,5 +207,7 @@ func (i *unitInspector) inspect(unit *AccessUnit) UnitInfo {
 	case found && !unknown:
 		info.Skip = SkipAll
 	}
+	info.Repeats = repeats && info.Skip == SkipAll
+	i.previousPOC, i.hasPrevious = poc, hasPOC && !unknown
 	return info
 }
