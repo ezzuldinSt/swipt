@@ -13,6 +13,12 @@ import (
 )
 
 func (p *Phone) Find(ctx context.Context, selectors []*Selector, depth int64) (*View, uint64, error) {
+	return p.find(ctx, selectors, depth, true)
+}
+
+// find reads the screen for the selectors as Find does; with kept, it may
+// answer the tree kept from an earlier read while that is current.
+func (p *Phone) find(ctx context.Context, selectors []*Selector, depth int64, kept bool) (*View, uint64, error) {
 	if len(selectors) == 0 {
 		return nil, 0, E.Extend(ErrInvalid, "find needs a selector")
 	}
@@ -41,17 +47,13 @@ func (p *Phone) Find(ctx context.Context, selectors []*Selector, depth int64) (*
 	if !scripted {
 		options.Attributes = accessibility.SnapshotAttributes(fields)
 	}
+	options.Animations = true
 	c, ctx, done, err := p.begin(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer done()
 	began := time.Now()
-	geometry, err := c.readGeometry(ctx)
-	if err != nil {
-		return nil, 0, err
-	}
-	geometryTook := time.Since(began)
 	var base *PhoneNode
 	if within != "" {
 		if base, err = p.element(c, within); err != nil {
@@ -73,11 +75,59 @@ func (p *Phone) Find(ctx context.Context, selectors []*Selector, depth int64) (*
 	}
 	key += ":" + strconv.FormatUint(options.PID, 10) + ":" + within + ":" + strconv.FormatInt(depth, 10) + ":" + strconv.FormatBool(options.Modal) + ":" +
 		strconv.FormatBool(options.Focused) + ":" + fmt.Sprint(options.Attributes)
+	snapshot := SnapshotOptions{Depth: depth, Within: within}
+	load := func(ctx context.Context, background bool) (*PhoneModel, error) {
+		return p.loadFind(ctx, c, key, options, base, snapshot, background)
+	}
+	var model *PhoneModel
+	cached := false
+	if kept {
+		model, cached, err = c.tree.read(ctx, key, load)
+	} else {
+		model, err = load(ctx, false)
+	}
+	if err != nil {
+		return nil, seen, err
+	}
+	if cached {
+		p.connection.trace(began, "find.cached", strconv.Itoa(len(model.nodes))+" nodes of "+model.BundleID, time.Since(began))
+	}
+	if model == nil {
+		return nil, seen, nil
+	}
+	c.nodes.add(model)
+	return NewView(model, true), seen, nil
+}
+
+func (p *Phone) loadFind(ctx context.Context, c *conn, key string, options accessibility.ApplicationOptions, base *PhoneNode, snapshot SnapshotOptions, background bool) (*PhoneModel, error) {
+	geometry := c.geometryAhead()
+	seen := c.events.screen.Load()
+	read := c.ax.read
+	if background {
+		read = c.ax.readLow
+	}
 	queued := time.Now()
-	value, err := c.ax.read(ctx, key, func(ctx context.Context, client *accessibility.RemoteClient) (any, error) {
+	value, err := read(ctx, key, func(ctx context.Context, client *accessibility.RemoteClient) (any, error) {
 		started := time.Now()
+		options := options
+		if options.PID == 0 && options.Root == nil {
+			options.Front = c.frontGuess()
+		}
 		screen, err := client.ReadApplication(ctx, options)
-		waits := "geometry " + geometryTook.String() + ", queued " + started.Sub(queued).String()
+		read := time.Now()
+		var waited time.Duration
+		var placed phoneGeometry
+		if err == nil && screen.Root != nil {
+			placed, err = geometry(ctx)
+			waited = time.Since(read)
+		}
+		waits := "geometry " + waited.String() + ", queued " + started.Sub(queued).String()
+		if background {
+			waits = "in the background, " + waits
+		}
+		if options.Front != nil {
+			waits += ", front guessed"
+		}
 		if err != nil {
 			p.connection.trace(started, "find.failed", waits+", "+err.Error(), time.Since(started))
 			if options.PID != 0 && E.IsMulti(err, accessibility.ErrNoAnswer, accessibility.ErrNoApplication) {
@@ -92,19 +142,14 @@ func (p *Phone) Find(ctx context.Context, selectors []*Selector, depth int64) (*
 			}
 			return (*PhoneModel)(nil), nil
 		}
-		model := p.model(c, geometry, screen, started, base, SnapshotOptions{Depth: depth, Within: within}, options.PID == 0 && base == nil)
+		model := p.model(c, placed, screen, started, base, snapshot, options.PID == 0 && base == nil)
 		p.connection.trace(started, "find.read", waits+", "+strconv.Itoa(len(model.nodes))+" nodes of "+screen.BundleID+", "+strconv.Itoa(len(model.Truncated))+" cut off, "+strconv.FormatUint(c.events.screen.Load()-seen, 10)+" screen changes since", time.Since(started))
 		return model, nil
 	})
 	if err != nil {
-		return nil, seen, err
+		return nil, err
 	}
-	model := value.(*PhoneModel)
-	if model == nil {
-		return nil, seen, nil
-	}
-	c.nodes.add(model)
-	return NewView(model, true), seen, nil
+	return value.(*PhoneModel), nil
 }
 
 func (p *Phone) Changed(ctx context.Context, seen uint64, timeout time.Duration) error {
@@ -155,6 +200,7 @@ func (p *Phone) Perform(ctx context.Context, ref, name string) (Aim, error) {
 		return Aim{}, err
 	}
 	defer done()
+	defer c.tree.act()()
 	geometry, err := c.readGeometry(ctx)
 	if err != nil {
 		return Aim{}, err

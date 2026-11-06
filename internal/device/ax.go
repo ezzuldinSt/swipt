@@ -187,6 +187,9 @@ func (w *axWorker) run() {
 }
 
 func (w *axWorker) execute(job *axJob) (any, error) {
+	if job.action {
+		defer w.conn.tree.act()()
+	}
 	if job.gen != 0 && job.gen != w.current() {
 		return nil, E.Extend(ErrStalled, "it was restarted since these elements were read, and they are gone; read the screen again")
 	}

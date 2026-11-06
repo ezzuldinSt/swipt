@@ -55,6 +55,7 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 		return Aim{}, err
 	}
 	defer done()
+	defer c.tree.act()()
 	geometry, err := p.prepare(ctx, c, true, true)
 	if err != nil {
 		return Aim{}, err
@@ -139,7 +140,7 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 			return s.target, err
 		}
 		if s.stale {
-			if _, err = p.read(ctx, c, s.reread); err != nil {
+			if _, _, err = p.read(ctx, c, s.reread); err != nil {
 				return s.target, err
 			}
 		}

@@ -343,6 +343,8 @@ type PhoneModel struct {
 	nodes      map[accessibility.ElementRef]*PhoneNode
 	generation uint64
 	read       SnapshotOptions
+	// animating is set when UIView animations ran as the tree was read.
+	animating bool
 }
 
 func (m *PhoneModel) Node(ref accessibility.ElementRef) *PhoneNode {
@@ -478,14 +480,24 @@ func (o SnapshotOptions) key() string {
 	return "screen:" + depth
 }
 
-func (p *Phone) read(ctx context.Context, c *conn, options SnapshotOptions) (*PhoneModel, error) {
+// read answers the tree a snapshot reads, the kept one while it is current.
+func (p *Phone) read(ctx context.Context, c *conn, options SnapshotOptions) (*PhoneModel, bool, error) {
 	options.Raw = false
-	geometry, err := c.readGeometry(ctx)
+	model, cached, err := c.tree.read(ctx, options.key(), func(ctx context.Context, background bool) (*PhoneModel, error) {
+		return p.load(ctx, c, options, background)
+	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	c.nodes.add(model)
+	return model, cached, nil
+}
+
+func (p *Phone) load(ctx context.Context, c *conn, options SnapshotOptions, background bool) (*PhoneModel, error) {
+	geometry := c.geometryAhead()
 	var base *PhoneNode
 	var springboard uint64
+	var err error
 	switch {
 	case options.Within != "":
 		if base, err = p.element(c, options.Within); err != nil {
@@ -496,28 +508,30 @@ func (p *Phone) read(ctx context.Context, c *conn, options SnapshotOptions) (*Ph
 			return nil, err
 		}
 	}
-	value, err := c.ax.read(ctx, options.key(), func(ctx context.Context, client *accessibility.RemoteClient) (any, error) {
+	read := c.ax.read
+	if background {
+		read = c.ax.readLow
+	}
+	value, err := read(ctx, options.key(), func(ctx context.Context, client *accessibility.RemoteClient) (any, error) {
 		return p.readScreen(ctx, c, client, geometry, springboard, base, options)
 	})
 	if err != nil {
 		return nil, err
 	}
-	model := value.(*PhoneModel)
-	c.nodes.add(model)
-	return model, nil
+	return value.(*PhoneModel), nil
 }
 
-func (p *Phone) readScreen(ctx context.Context, c *conn, client *accessibility.RemoteClient, geometry phoneGeometry, springboard uint64, base *PhoneNode, options SnapshotOptions) (*PhoneModel, error) {
+func (p *Phone) readScreen(ctx context.Context, c *conn, client *accessibility.RemoteClient, geometryAhead func(ctx context.Context) (phoneGeometry, error), springboard uint64, base *PhoneNode, options SnapshotOptions) (*PhoneModel, error) {
 	started := time.Now()
 	var screen *accessibility.Screen
 	var err error
 	switch {
 	case base != nil:
 		screen, err = client.ReadApplication(ctx, accessibility.ApplicationOptions{
-			Root: &base.AX, Clip: &base.axClip, Depth: options.Depth, Modal: true, Focused: true, Expand: true,
+			Root: &base.AX, Clip: &base.axClip, Depth: options.Depth, Modal: true, Focused: true, Expand: true, Animations: true,
 		})
 	case options.Front:
-		screen, err = client.ReadApplication(ctx, accessibility.ApplicationOptions{Depth: options.Depth, Focused: true, Expand: true})
+		screen, err = client.ReadApplication(ctx, accessibility.ApplicationOptions{Depth: options.Depth, Focused: true, Expand: true, Animations: true, Front: c.frontGuess()})
 	default:
 		screen, err = client.ReadScreen(ctx, springboard, options.Depth, nil)
 		if errors.Is(err, accessibility.ErrNoApplication) {
@@ -527,12 +541,17 @@ func (p *Phone) readScreen(ctx context.Context, c *conn, client *accessibility.R
 	if err != nil {
 		return nil, err
 	}
+	geometry, err := geometryAhead(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return p.model(c, geometry, screen, started, base, options, base == nil), nil
 }
 
 func (p *Phone) model(c *conn, geometry phoneGeometry, screen *accessibility.Screen, started time.Time, base *PhoneNode, read SnapshotOptions, front bool) *PhoneModel {
 	model := modelOf(geometry, screen, base)
 	model.generation = c.ax.current()
+	model.animating = screen.Animating
 	model.read = read
 	root := "the application"
 	if base != nil {
@@ -547,8 +566,51 @@ func (p *Phone) model(c *conn, geometry phoneGeometry, screen *accessibility.Scr
 	c.ax.answered(screen.App.Ref.PID)
 	if front {
 		c.front.observed(frontApplication{pid: screen.App.Ref.PID, bundleID: screen.BundleID, at: started, via: "tree"})
+		if screen.BundleID != "" {
+			c.lastFront.Store(&accessibility.Front{App: screen.App, BundleID: screen.BundleID})
+		}
 	}
 	return model
+}
+
+// frontGuess answers the application last read as the frontmost one while
+// the app in front is known to be it, so that a read can take it for the
+// frontmost one in the same round.
+func (c *conn) frontGuess() *accessibility.Front {
+	guess := c.lastFront.Load()
+	if guess == nil {
+		return nil
+	}
+	if pid, known := c.front.known(); !known || pid != guess.App.Ref.PID {
+		return nil
+	}
+	return guess
+}
+
+// geometryLimit bounds a geometry read that a read of the tree waits for.
+const geometryLimit = 10 * time.Second
+
+// geometryAhead reads the geometry alongside a read of the tree, which waits
+// for it only to place what it read: a geometry read took up to 240 ms over
+// Wi-Fi once its cache had expired (iPhone18,2, iOS 27.0.1 24A446).
+func (c *conn) geometryAhead() func(ctx context.Context) (phoneGeometry, error) {
+	done := make(chan struct{})
+	var geometry phoneGeometry
+	var err error
+	go func() {
+		defer close(done)
+		ctx, cancel := context.WithTimeout(c.ctx, geometryLimit)
+		defer cancel()
+		geometry, err = c.readGeometry(ctx)
+	}()
+	return func(ctx context.Context) (phoneGeometry, error) {
+		select {
+		case <-done:
+			return geometry, err
+		case <-ctx.Done():
+			return phoneGeometry{}, ctx.Err()
+		}
+	}
 }
 
 func (p *Phone) Snapshot(ctx context.Context, options SnapshotOptions) (*View, error) {
@@ -561,11 +623,15 @@ func (p *Phone) Snapshot(ctx context.Context, options SnapshotOptions) (*View, e
 	}
 	defer done()
 	started := time.Now()
-	model, err := p.read(ctx, c, options)
+	model, cached, err := p.read(ctx, c, options)
 	if err != nil {
 		return nil, err
 	}
-	p.connection.trace(started, "snapshot.read", strconv.Itoa(len(model.nodes))+" nodes of "+model.BundleID+", "+strconv.Itoa(len(model.Truncated))+" cut off", time.Since(started))
+	name := "snapshot.read"
+	if cached {
+		name = "snapshot.cached"
+	}
+	p.connection.trace(started, name, strconv.Itoa(len(model.nodes))+" nodes of "+model.BundleID+", "+strconv.Itoa(len(model.Truncated))+" cut off", time.Since(started))
 	return NewView(model, options.Raw), nil
 }
 

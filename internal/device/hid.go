@@ -352,6 +352,7 @@ func (q *hidQueue) handle(ctx context.Context, item hidItem) {
 	switch {
 	case item.release:
 		if q.client != nil {
+			c.tree.changed()
 			if len(q.connection.sessions()) == 0 {
 				q.closeClient()
 				return
@@ -416,6 +417,8 @@ func (q *hidQueue) handle(ctx context.Context, item hidItem) {
 	if q.touch.geometry.Width < 2 || q.touch.geometry.Height < 2 {
 		return
 	}
+	acted := c.tree.act()
+	defer acted()
 	if err := q.dispatch(eventContext, item); err != nil {
 		q.logger.Debug(E.Cause(err, "send input ", fmt.Sprint(item.event)))
 		q.closeClient()
@@ -517,6 +520,7 @@ func (s *Connection) pressButton(ctx context.Context, button hid.Button, count i
 		return err
 	}
 	defer release()
+	defer c.tree.act()()
 	ctx, cancel := c.operation(ctx)
 	defer cancel()
 	grant, err := s.input.acquire(ctx, c)

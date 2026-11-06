@@ -110,6 +110,18 @@ func (f *foreground) get(ctx context.Context) (frontApplication, error) {
 	return f.read(ctx)
 }
 
+// known answers the pid of the app in front when get would answer it without
+// reading.
+func (f *foreground) known() (uint64, bool) {
+	f.access.Lock()
+	defer f.access.Unlock()
+	current := f.current
+	if current.pid != 0 && !current.at.Before(f.actedAt) && (f.tracked && current.bundleID != "" || time.Since(current.at) < recentFront) {
+		return current.pid, true
+	}
+	return 0, false
+}
+
 func (f *foreground) read(ctx context.Context) (frontApplication, error) {
 	value, err := f.conn.ax.readLow(ctx, "frontmost", func(ctx context.Context, client *accessibility.RemoteClient) (any, error) {
 		seen := time.Now()

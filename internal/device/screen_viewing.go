@@ -173,7 +173,9 @@ func (c *conn) dismissScreenViewingBanner(ctx context.Context) error {
 	}
 	dismissed := false
 	for ctx.Err() == nil {
-		view, _, err := c.connection.phone.Find(ctx, []*Selector{selector}, screenViewingDepth)
+		// Each read goes to the device: the banner shows in SpringBoard's tree
+		// without a push, so a kept tree would hide it.
+		view, _, err := c.connection.phone.find(ctx, []*Selector{selector}, screenViewingDepth, false)
 		if err != nil {
 			return err
 		}
