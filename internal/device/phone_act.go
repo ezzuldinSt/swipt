@@ -489,7 +489,7 @@ func (p *Phone) Launch(ctx context.Context, bundleID, url string, restart, anima
 			started = time.Now()
 			launchContext, cancel := context.WithDeadline(ctx, started.Add(launchLimit))
 			defer cancel()
-			err := apps.Launch(launchContext, c.device, bundleID, url, restart, animated)
+			_, err := apps.Launch(launchContext, c.device, bundleID, url, restart, animated)
 			if err == nil {
 				return nil
 			}
