@@ -127,7 +127,11 @@ func stream(ctx context.Context, conn *xpc.Conn, input map[string]any) ([]any, e
 // 27B5028f CoreDeviceUtilities 0x396e18..0x396e50), which writes a keyed
 // container of relative and an optional base (swift-foundation e577ad6,
 // Sources/FoundationEssentials/URL/URL.swift:2048-2073).
-func Launch(ctx context.Context, device *coredevice.Device, bundleID, payloadURL string, terminateExisting, animated bool) error {
+//
+// Launch answers the PID in the output's processToken, a token like those of
+// the process list, or 0 when there is none; that token was not checked on a
+// device.
+func Launch(ctx context.Context, device *coredevice.Device, bundleID, payloadURL string, terminateExisting, animated bool) (uint64, error) {
 	open := map[string]any{}
 	if !animated {
 		// platformSpecificOptions reach FrontBoard as open options, and SpringBoard
@@ -148,11 +152,6 @@ func Launch(ctx context.Context, device *coredevice.Device, bundleID, payloadURL
 	if payloadURL != "" {
 		options["payloadURL"] = map[string]any{"relative": payloadURL}
 	}
-	conn, err := device.DialXPC(ctx, serviceName)
-	if err != nil {
-		return E.Cause(err, "apps: launch ", bundleID)
-	}
-	defer conn.Close()
 	input := map[string]any{
 		"applicationSpecifier": map[string]any{
 			"bundleIdentifier": map[string]any{"_0": bundleID},
@@ -160,16 +159,39 @@ func Launch(ctx context.Context, device *coredevice.Device, bundleID, payloadURL
 		"options":               options,
 		"standardIOIdentifiers": map[string]any{},
 	}
-	_, err = coredevice.InvokeFeature(ctx, conn, uuid.NewString(), launchFeature, "", input)
-	// Relaunching an app whose previous process is still exiting fails with CoreDeviceError 10004, "The process
-	// identifier of the launched application could not be determined" (iPhone18,2, iOS 27.2 24B115).
-	if featureError, isFeatureError := errors.AsType[*coredevice.FeatureError](err); isFeatureError && terminateExisting && featureError.Code == errorCodeProcessUnknown {
-		_, err = coredevice.InvokeFeature(ctx, conn, uuid.NewString(), launchFeature, "", input)
-	}
+	var output map[string]any
+	// A launch repeated on a new connection ends with the same app in front.
+	err := device.Service(serviceName).Do(ctx, true, func(conn *xpc.Conn) error {
+		var err error
+		output, err = coredevice.InvokeFeature(ctx, conn, uuid.NewString(), launchFeature, "", input)
+		// Relaunching an app whose previous process is still exiting fails with CoreDeviceError 10004, "The process
+		// identifier of the launched application could not be determined" (iPhone18,2, iOS 27.2 24B115).
+		if featureError, isFeatureError := errors.AsType[*coredevice.FeatureError](err); isFeatureError && terminateExisting && featureError.Code == errorCodeProcessUnknown {
+			output, err = coredevice.InvokeFeature(ctx, conn, uuid.NewString(), launchFeature, "", input)
+		}
+		return err
+	})
 	if err != nil {
-		return E.Cause(err, "apps: launch ", bundleID)
+		return 0, E.Cause(err, "apps: launch ", bundleID)
 	}
-	return nil
+	return launchedPID(output), nil
+}
+
+func launchedPID(output map[string]any) uint64 {
+	token, _ := output["processToken"].(map[string]any)
+	return processIdentifier(token["processIdentifier"])
+}
+
+func processIdentifier(value any) uint64 {
+	switch pid := value.(type) {
+	case int64:
+		if pid > 0 {
+			return uint64(pid)
+		}
+	case uint64:
+		return pid
+	}
+	return 0
 }
 
 type Process struct {
@@ -181,12 +203,7 @@ type Process struct {
 // process token (idevice d32c818, idevice/src/services/core_device/app_service.rs:70-76,
 // 302-322).
 func Processes(ctx context.Context, device *coredevice.Device) ([]Process, error) {
-	conn, err := device.DialXPC(ctx, serviceName)
-	if err != nil {
-		return nil, E.Cause(err, "apps: list processes")
-	}
-	defer conn.Close()
-	output, err := coredevice.InvokeFeature(ctx, conn, uuid.NewString(), processesFeature, "", map[string]any{})
+	output, err := device.Service(serviceName).Invoke(ctx, uuid.NewString(), processesFeature, "", map[string]any{})
 	if err != nil {
 		return nil, E.Cause(err, "apps: list processes")
 	}
@@ -223,12 +240,7 @@ func Processes(ctx context.Context, device *coredevice.Device) ([]Process, error
 // processIdentifier (idevice d32c818,
 // idevice/src/services/core_device/app_service.rs:343-359).
 func Kill(ctx context.Context, device *coredevice.Device, pid uint64) error {
-	conn, err := device.DialXPC(ctx, serviceName)
-	if err != nil {
-		return E.Cause(err, "apps: kill process ", pid)
-	}
-	defer conn.Close()
-	_, err = coredevice.InvokeFeature(ctx, conn, uuid.NewString(), signalFeature, "", map[string]any{
+	_, err := device.Service(serviceName).Invoke(ctx, uuid.NewString(), signalFeature, "", map[string]any{
 		"process": map[string]any{"processIdentifier": int64(pid)},
 		"signal":  int64(syscall.SIGKILL),
 	})
