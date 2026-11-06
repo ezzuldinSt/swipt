@@ -94,6 +94,10 @@ func (s *Connection) updateDiskImage(ctx context.Context, images *imagemounter.C
 		return nil
 	}
 	files, err := s.diskImageFiles(ctx, directory, imagemounter.Cryptex)
+	if errors.Is(err, fs.ErrNotExist) {
+		// A directory with the personalized image only has nothing to update from.
+		return nil
+	}
 	if err != nil {
 		return &Error{Problem: ProblemDiskImage, Err: E.Cause(err, "find ", imagemounter.Cryptex, " disk image files")}
 	}
