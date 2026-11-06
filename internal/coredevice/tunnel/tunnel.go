@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tun "github.com/sagernet/sing-tun"
@@ -109,6 +110,9 @@ const maxWrite = 256 << 10
 
 const retryDelay = time.Millisecond
 
+// observer, set only by tests, sees each packet the tunnel carries.
+var observer atomic.Pointer[func(inbound bool, packet []byte)]
+
 type Tunnel struct {
 	conn          net.Conn
 	reader        *bufio.Reader
@@ -200,7 +204,11 @@ func (t *Tunnel) RemoteAddr() net.Addr {
 func (t *Tunnel) writePackets(packets []*buf.Buffer) {
 	defer buf.ReleaseMulti(packets)
 	data := t.writeBuffer[:0]
+	observe := observer.Load()
 	for _, packet := range packets {
+		if observe != nil {
+			(*observe)(false, packet.Bytes())
+		}
 		if len(data) > 0 && len(data)+packet.Len() > maxWrite {
 			if !t.write(data) {
 				return
@@ -250,11 +258,15 @@ func (t *Tunnel) readLoop() {
 		}
 		data, _ := t.reader.Peek(total)
 		arrived := time.Now()
+		observe := observer.Load()
 		packets = packets[:0]
 		offset := 0
 		for _, length := range lengths {
 			packet := data[offset : offset+length]
 			offset += length
+			if observe != nil {
+				(*observe)(true, packet)
+			}
 			if t.deliverDirect(packet, arrived) {
 				continue
 			}
