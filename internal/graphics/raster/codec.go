@@ -59,7 +59,7 @@ func decodeRaster(data []byte, found metadata) (*raster, error) {
 		return nil, failureCause(NameData, err, "graphics: the image could not be decoded")
 	}
 	r := colorRaster(decoded)
-	if c := conversionOf(found.profile); c != nil {
+	if c := found.colorConversion(); c != nil {
 		c.apply(r)
 	}
 	return oriented(r, found.orientation), nil

@@ -10,11 +10,25 @@ import (
 )
 
 // metadata is what ImageIO reads besides the pixels: kCGImagePropertyOrientation,
-// kCGImagePropertyDPIWidth and the ICC profile.
+// kCGImagePropertyDPIWidth, the ICC profile, and a PNG's cICP chunk: the colour primaries,
+// transfer characteristics, matrix coefficients and range of ITU-T H.273.
 type metadata struct {
 	orientation int
 	dpi         float64
 	profile     []byte
+	cicp        []byte
+}
+
+// colorConversion answers how to bring the pixels to sRGB, nil when they are sRGB already. The
+// cICP chunk takes precedence over the ICC profile (PNG Third Edition 4.3); one whose colors
+// cannot be converted, such as PQ or HLG ones, leaves the choice to the profile.
+func (m metadata) colorConversion() *conversion {
+	if len(m.cicp) == 4 && m.cicp[2] == 0 {
+		if c, ok := cicpConversion(m.cicp[0], m.cicp[1], m.cicp[3] == 1); ok {
+			return c
+		}
+	}
+	return conversionOf(m.profile)
 }
 
 const pngSignature = "\x89PNG\r\n\x1a\n"
@@ -50,6 +64,10 @@ func pngMetadata(data []byte) metadata {
 				if reader, err := zlib.NewReader(bytes.NewReader(chunk[separator+2:])); err == nil {
 					found.profile, _ = io.ReadAll(io.LimitReader(reader, 16<<20))
 				}
+			}
+		case "cICP":
+			if len(chunk) == 4 {
+				found.cicp = chunk
 			}
 		case "eXIf":
 			found.orientation, _ = exifFields(chunk)
