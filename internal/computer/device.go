@@ -12,7 +12,6 @@ import (
 	"github.com/swipt-automation/swipt/internal/coredevice"
 	"github.com/swipt-automation/swipt/internal/coredevice/lockdown"
 	"github.com/swipt-automation/swipt/internal/device"
-	"github.com/swipt-automation/swipt/internal/log"
 	"github.com/swipt-automation/swipt/internal/rfb"
 	"github.com/swipt-automation/swipt/internal/usbmuxd"
 )
@@ -126,27 +125,11 @@ func findLockdownPeer(ctx context.Context, udid string) (lockdownPeer, error) {
 	if found.ID == 0 {
 		return lockdownPeer{}, &device.Error{Problem: device.ProblemNoTunnel, Err: E.New("the device is not connected to ", thisComputer)}
 	}
-	data, err := usbmuxd.ReadPairRecord(ctx, udid)
-	if err != nil {
-		return lockdownPeer{}, E.Cause(err, "read the pair record")
-	}
-	record, err := lockdown.ParsePairRecord(data)
+	record, err := readPairRecord(ctx, udid)
 	if err != nil {
 		return lockdownPeer{}, err
 	}
-	record.UDID = udid
 	return lockdownPeer{device: found, record: record}, nil
-}
-
-func connect(udid string, logger log.ContextLogger) func(ctx context.Context) (*coredevice.Device, error) {
-	return func(ctx context.Context) (*coredevice.Device, error) {
-		peer, err := findLockdownPeer(ctx, udid)
-		if err != nil {
-			return nil, err
-		}
-		logger.Debug("connecting through ", peer.device.Connection, " as usbmuxd device ", peer.device.ID)
-		return coredevice.ConnectLockdown(ctx, coredevice.LockdownOptions{Record: peer.record, Dial: dialer(peer.device.ID), Logger: logger})
-	}
 }
 
 type observer struct{}

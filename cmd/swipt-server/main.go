@@ -36,6 +36,7 @@ func main() {
 	command.Flags().StringVar(&options.Passcode, "passcode", "", "unlock device with this passcode")
 	command.Flags().StringVar(&options.PasscodeType, "passcode-type", "", "pin (4 or 6 digits, default), numeric or alphanumeric")
 	command.Flags().StringVar(&options.DiskImage, "disk-image", "", "the directory of the Developer Disk Image to mount (default: Xcode's on macOS)")
+	command.Flags().BoolVar(&options.Relay, "relay", false, "reach a device on Wi-Fi through usbmuxd's relay, not at its network address (also "+computer.RelayVariable+"=1)")
 	pairCommand := &cobra.Command{
 		Use:          "pair [-d NAME|UDID] [-o FILE]",
 		Short:        "Create a remote pairing record for Swipt",

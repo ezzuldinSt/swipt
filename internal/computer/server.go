@@ -14,6 +14,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/swipt-automation/swipt/internal/api"
 	"github.com/swipt-automation/swipt/internal/automation"
+	"github.com/swipt-automation/swipt/internal/coredevice"
 	"github.com/swipt-automation/swipt/internal/device"
 	"github.com/swipt-automation/swipt/internal/graphics"
 	"github.com/swipt-automation/swipt/internal/log"
@@ -30,9 +31,12 @@ type Options struct {
 	Passcode     string
 	PasscodeType string
 	DiskImage    string
-	Version      string
-	Logs         *log.Factory
-	Output       io.Writer
+	// Relay keeps a device on Wi-Fi behind usbmuxd's relay, as RelayVariable
+	// does, instead of connecting to its network address.
+	Relay   bool
+	Version string
+	Logs    *log.Factory
+	Output  io.Writer
 }
 
 func Run(ctx context.Context, options Options) error {
@@ -85,9 +89,14 @@ func Run(ctx context.Context, options Options) error {
 		}
 	}
 	deviceLogger := options.Logs.NewLogger("device")
+	route := newRouter(paired.UDID, relayForced(options.Relay, os.Getenv(RelayVariable)), deviceLogger)
 	connection := device.New(device.Options{
-		Name:               paired.Name,
-		Connect:            connect(paired.UDID, deviceLogger),
+		Name:    paired.Name,
+		Connect: route.connect,
+		Moved: func(ctx context.Context, connected *coredevice.Device) bool {
+			_, remote := connected.TransportAddr()
+			return route.moved(ctx, remote)
+		},
 		Logger:             deviceLogger,
 		Observer:           observer{},
 		DiskImageDirectory: diskImage,
