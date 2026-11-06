@@ -3,6 +3,7 @@ package feed
 import (
 	"bytes"
 	"context"
+	"image"
 	"runtime"
 	"strconv"
 	"sync"
@@ -74,14 +75,20 @@ type Stats struct {
 	KeyFrameRequests int64
 }
 
-// screen is the device's stream, a *device.ScreenFeed.
-type screen interface {
+// Screen is an open stream of the device's screen, a *device.ScreenFeed.
+type Screen interface {
 	Info() device.ScreenInfo
 	RequestKeyFrame()
 	Close()
 }
 
-type opener func(ctx context.Context, deliver func(batch []byte), end func(err error)) (screen, error)
+type screen = Screen
+
+// Opener opens the screen's stream: deliver takes its batches of records (device.appendFeedRecord)
+// and end its failure, as device.Connection.OpenScreen does.
+type Opener func(ctx context.Context, deliver func(batch []byte), end func(err error)) (Screen, error)
+
+type opener = Opener
 
 // Feed keeps the newest frame of the device's screen while anyone holds a lease (SWScreenFeed.m).
 // The first lease opens the stream; it closes a second after the last one is released.
@@ -110,6 +117,10 @@ type Feed struct {
 	decoderName                                   atomic.Pointer[string]
 	// observeDecoded, when set before the first Acquire, sees the arrival of every decoded frame.
 	observeDecoded func(arrival float64)
+
+	nextListener   int
+	unitListeners  map[int]func(*AccessUnit)
+	frameListeners map[int]func(*Frame)
 }
 
 // New makes a feed of the connection's screen.
@@ -125,11 +136,63 @@ func New(connection *device.Connection, logger log.ContextLogger) *Feed {
 	return f
 }
 
+// NewWithOpener makes a feed of the stream that open opens, such as a stored one in a test;
+// it decodes with Media Foundation like New.
+func NewWithOpener(open Opener, logger log.ContextLogger) *Feed {
+	f := newFeed(open, newCodec, logger)
+	f.check = available
+	return f
+}
+
 func newFeed(open opener, factory codecFactory, contextLogger log.ContextLogger) *Feed {
 	if contextLogger == nil {
 		contextLogger = logger.NOP()
 	}
-	return &Feed{open: open, newCodec: factory, logger: contextLogger, changed: make(chan struct{})}
+	return &Feed{
+		open: open, newCodec: factory, logger: contextLogger, changed: make(chan struct{}),
+		unitListeners: make(map[int]func(*AccessUnit)), frameListeners: make(map[int]func(*Frame)),
+	}
+}
+
+// AddUnitListener calls listener with every access unit of the stream, damaged ones too, in
+// order on the decoding goroutine before the unit is decoded, while anyone holds a lease
+// (SWScreenFeed.m addUnitListener:). The unit's NAL units stay valid after the call.
+func (f *Feed) AddUnitListener(listener func(*AccessUnit)) int {
+	f.access.Lock()
+	defer f.access.Unlock()
+	f.nextListener++
+	f.unitListeners[f.nextListener] = listener
+	return f.nextListener
+}
+
+// AddFrameListener calls listener with every decoded frame on the decoding goroutine
+// (SWScreenFeed.m addFrameListener:); the listener releases the frame when done with it, at
+// once or later.
+func (f *Feed) AddFrameListener(listener func(*Frame)) int {
+	f.access.Lock()
+	defer f.access.Unlock()
+	f.nextListener++
+	f.frameListeners[f.nextListener] = listener
+	return f.nextListener
+}
+
+// RemoveListener stops a unit or frame listener; a call already under way finishes.
+func (f *Feed) RemoveListener(identifier int) {
+	f.access.Lock()
+	defer f.access.Unlock()
+	delete(f.unitListeners, identifier)
+	delete(f.frameListeners, identifier)
+}
+
+func (f *Feed) unitListenersLocked() []func(*AccessUnit) {
+	if len(f.unitListeners) == 0 {
+		return nil
+	}
+	listeners := make([]func(*AccessUnit), 0, len(f.unitListeners))
+	for _, listener := range f.unitListeners {
+		listeners = append(listeners, listener)
+	}
+	return listeners
 }
 
 // broadcastLocked wakes everyone waiting for a frame or for the stream to open.
@@ -300,14 +363,21 @@ func (f *Feed) decoded(s *session, picture *picture, unit *AccessUnit) {
 		return
 	}
 	made := &frame{picture: picture, time: unit.Arrival, turns: unit.Turns(), geometry: f.geometry, feed: f}
-	made.refs.Store(1)
+	made.refs.Store(int32(1 + len(f.frameListeners)))
 	f.replaceLatestLocked(made)
 	f.sequence++
 	f.broadcastLocked()
+	listeners := make([]func(*Frame), 0, len(f.frameListeners))
+	for _, listener := range f.frameListeners {
+		listeners = append(listeners, listener)
+	}
 	f.access.Unlock()
 	f.frames.Add(1)
 	if f.observeDecoded != nil {
 		f.observeDecoded(unit.Arrival)
+	}
+	for _, listener := range listeners {
+		listener(&Frame{frame: made})
 	}
 }
 
@@ -466,6 +536,70 @@ type frame struct {
 	access  sync.Mutex
 	picture *picture
 	made    *raster.Image
+	quarter *image.Gray
+}
+
+// Frame is a decoded frame that a frame listener gets (SWFrame.m); Release gives it back.
+type Frame struct {
+	frame    *frame
+	released atomic.Bool
+}
+
+// Time is when the frame's first packet arrived, in milliseconds since the epoch.
+func (fr *Frame) Time() float64 {
+	return fr.frame.time
+}
+
+// Turns is the quarter turns clockwise that make the frame upright.
+func (fr *Frame) Turns() int {
+	return fr.frame.turns
+}
+
+// Release gives the frame back; it may be called more than once.
+func (fr *Frame) Release() {
+	if fr.released.CompareAndSwap(false, true) {
+		fr.frame.release()
+	}
+}
+
+// Quarter answers the frame cropped to the screen and shrunk to a quarter of its size, in gray
+// and turned upright, which the change tracker of a recording compares (SWFrame.m quarter:).
+// It is made once.
+func (fr *Frame) Quarter(ctx context.Context) (*image.Gray, error) {
+	if fr.released.Load() {
+		return nil, &raster.Error{Name: raster.NameState, Message: "graphics: the frame was released"}
+	}
+	f := fr.frame
+	f.access.Lock()
+	defer f.access.Unlock()
+	if f.quarter != nil {
+		return f.quarter, nil
+	}
+	switch {
+	case f.picture != nil:
+		width, height := f.cropSize(f.picture.width, f.picture.height)
+		f.quarter = f.picture.quarterGray(width, height, f.turns)
+	case f.made != nil:
+		pixels, err := f.made.Pixels(ctx)
+		if err != nil {
+			return nil, err
+		}
+		f.quarter = quarterOfImage(pixels)
+	default:
+		return nil, &raster.Error{Name: raster.NameUnavailable, Message: "graphics: the frame is gone"}
+	}
+	return f.quarter, nil
+}
+
+// cropSize is the part of a picture that shows the screen (SWFrame.m initWithPixelBuffer:).
+func (fr *frame) cropSize(width, height int) (int, int) {
+	if fr.geometry.Width > 0 {
+		width = min(width, fr.geometry.Width)
+	}
+	if fr.geometry.Height > 0 {
+		height = min(height, fr.geometry.Height)
+	}
+	return width, height
 }
 
 func (fr *frame) release() {
@@ -493,13 +627,7 @@ func (fr *frame) image(ctx context.Context) (*raster.Image, error) {
 	if fr.picture == nil {
 		return nil, &raster.Error{Name: raster.NameUnavailable, Message: "graphics: the frame is gone"}
 	}
-	width, height := fr.picture.width, fr.picture.height
-	if fr.geometry.Width > 0 {
-		width = min(width, fr.geometry.Width)
-	}
-	if fr.geometry.Height > 0 {
-		height = min(height, fr.geometry.Height)
-	}
+	width, height := fr.cropSize(fr.picture.width, fr.picture.height)
 	pixels := fr.picture.rgba(width, height, fr.turns)
 	fr.made = raster.FromImage(pixels, fr.geometry.Scale, fr.time)
 	recycleRGBA(pixels)
@@ -563,6 +691,7 @@ func (s *session) run(opened screen) {
 	decoder := newFrameDecoder(f.newCodec, f.options, f.logger, func(picture *picture, unit *AccessUnit) {
 		f.decoded(s, picture, unit)
 	})
+	var listeners []func(*AccessUnit)
 	defer decoder.close()
 	var depacketizer Depacketizer
 	var units []*AccessUnit
@@ -573,9 +702,17 @@ func (s *session) run(opened screen) {
 			return
 		case batch := <-s.batches:
 			units = depacketizer.PushBatch(batch, units[:0])
+			if len(units) > 0 {
+				f.access.Lock()
+				listeners = f.unitListenersLocked()
+				f.access.Unlock()
+			}
 			for _, unit := range units {
 				if unit.Damaged {
 					f.damaged.Add(1)
+				}
+				for _, listener := range listeners {
+					listener(unit)
 				}
 				if decoder.decode(unit) {
 					f.requests.Add(1)

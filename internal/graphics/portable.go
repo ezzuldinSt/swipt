@@ -31,13 +31,15 @@ type Graphics struct {
 }
 
 // engine keeps the prepared calls and the results of one JavaScript context
-// until it takes them, like SWEngine.m.
+// until it takes them, like SWEngine.m, and the recordings it started, which
+// stop when it closes.
 type engine struct {
-	access   sync.Mutex
-	next     int64
-	prepared map[int64]*prepared
-	objects  map[int64]any
-	closed   bool
+	access     sync.Mutex
+	next       int64
+	prepared   map[int64]*prepared
+	objects    map[int64]any
+	recordings map[*recordingSession]struct{}
+	closed     bool
 }
 
 type prepared struct {
@@ -102,6 +104,14 @@ const bridge = `(native => {
 		case "text":
 			facade = { boundingBox: (line, candidate, start, end) => call("boundingBox", line, candidate, start, end) };
 			break;
+		case "recording": {
+			const info = call("info");
+			facade = { path: info.path, start: info.start };
+			break;
+		}
+		case "video":
+			facade = { info: call("info"), frame: time => adopt(call("frame", time)) };
+			break;
 		default:
 			return null;
 		}
@@ -142,7 +152,7 @@ func (g *Graphics) lease(ctx context.Context) *feed.Lease {
 }
 
 func (g *Graphics) Install(js *jsc.Context, native jsc.Value, id uint64) {
-	e := &engine{prepared: make(map[int64]*prepared), objects: make(map[int64]any)}
+	e := &engine{prepared: make(map[int64]*prepared), objects: make(map[int64]any), recordings: make(map[*recordingSession]struct{})}
 	g.access.Lock()
 	g.engines[id] = e
 	g.access.Unlock()
@@ -261,6 +271,13 @@ func (g *Graphics) execute(ctx context.Context, e *engine, it *prepared, call *a
 		}
 		return recognize.ReadBarcodes(ctx, source)
 	}
+	if call, isVideo := videoCalls[it.method]; isVideo {
+		arguments, err := raster.ParseArguments(it.arguments)
+		if err != nil {
+			return nil, err
+		}
+		return call(g, ctx, env, it, arguments)
+	}
 	return raster.Run(ctx, it.method, it.arguments, it.objects, env)
 }
 
@@ -366,9 +383,12 @@ func (e *engine) take(js *jsc.Context, arguments []jsc.Value) (any, error) {
 		return nil, nil
 	}
 	object := e.object(int64(arguments[0].Number()))
-	switch object.(type) {
-	case *raster.Image, *recognize.Text:
+	switch it := object.(type) {
+	case *raster.Image, *recognize.Text, *videoModel:
 		return js.NewHostObject(object, nil), nil
+	case *recordingSession:
+		// A recording whose handle goes without being stopped stops itself (SWHandles.m dealloc).
+		return js.NewHostObject(object, it.abandon), nil
 	}
 	return nil, nil
 }
@@ -466,6 +486,22 @@ func (e *engine) op(js *jsc.Context, arguments []jsc.Value) (any, error) {
 			}
 			return box, nil
 		}
+	case *recordingSession:
+		switch name {
+		case "kind":
+			return "recording", nil
+		case "info":
+			return map[string]any{"path": it.path, "start": it.Start()}, nil
+		}
+	case *videoModel:
+		switch name {
+		case "kind":
+			return "video", nil
+		case "info":
+			return it.infoJSON(), nil
+		case "frame":
+			return handle(it.nodeAt(number(0))), nil
+		}
 	default:
 		if name == "kind" {
 			return "", nil
@@ -484,12 +520,29 @@ func (e *engine) takePrepared(id int64) *prepared {
 
 func (e *engine) keep(object any) int64 {
 	e.access.Lock()
-	defer e.access.Unlock()
 	e.next++
-	if !e.closed {
-		e.objects[e.next] = object
+	identifier, accepted := e.next, !e.closed
+	if accepted {
+		e.objects[identifier] = object
 	}
-	return e.next
+	e.access.Unlock()
+	if session, isRecording := object.(*recordingSession); isRecording && !accepted {
+		session.abandon()
+	}
+	return identifier
+}
+
+// addRecording remembers a recording, to stop it if it is still going when the engine closes.
+func (e *engine) addRecording(session *recordingSession) {
+	e.access.Lock()
+	closed := e.closed
+	if !closed {
+		e.recordings[session] = struct{}{}
+	}
+	e.access.Unlock()
+	if closed {
+		session.abandon()
+	}
 }
 
 func (e *engine) object(id int64) any {
@@ -506,10 +559,15 @@ func (e *engine) drop(id int64) {
 
 func (e *engine) close() {
 	e.access.Lock()
-	defer e.access.Unlock()
 	e.closed = true
 	clear(e.prepared)
 	clear(e.objects)
+	recordings := e.recordings
+	e.recordings = make(map[*recordingSession]struct{})
+	e.access.Unlock()
+	for session := range recordings {
+		session.abandon()
+	}
 }
 
 // environment gives raster.Run what SWGoBridge.m gives the Objective-C calls.

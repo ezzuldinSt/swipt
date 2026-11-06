@@ -275,3 +275,136 @@ func parallel(count int, work func(start, end int)) {
 	}
 	group.Wait()
 }
+
+// grayOf weighs red 77, green 150 and blue 29 out of 256, as raster's grayscale and
+// vImageMatrixMultiply_ARGB8888ToPlanar8 do.
+func grayOf(red, green, blue int32) byte {
+	return byte((77*red + 150*green + 29*blue) >> 8)
+}
+
+// quarterGray shrinks the top-left width by height of the picture to a quarter of its size by
+// averaging blocks, grays it and turns it clockwise by quarter turns (SWFrame.m makeQuarter:,
+// which scales with VTPixelTransferSession). Averaging Y, Cb and Cr first is averaging the
+// colors, as the conversion is linear before it clamps.
+func (p *picture) quarterGray(width, height, turns int) *image.Gray {
+	width, height = min(width, p.width), min(height, p.height)
+	outWidth, outHeight := max(width/4, 1), max(height/4, 1)
+	plane := image.NewGray(image.Rect(0, 0, outWidth, outHeight))
+	c := coefficientsOf(p.matrix, p.fullRange)
+	parallel(outHeight, func(start, end int) {
+		sums := make([]int32, outWidth*3)
+		for qy := start; qy < end; qy++ {
+			clear(sums)
+			top, bottom := qy*height/outHeight, (qy+1)*height/outHeight
+			for y := top; y < bottom; y++ {
+				for qx := range outWidth {
+					left, right := qx*width/outWidth, (qx+1)*width/outWidth
+					var luma, cb, cr int32
+					if p.layout == layoutAYUV {
+						row := p.luma[y*p.stride+left*4 : y*p.stride+right*4]
+						for x := 0; x+3 < len(row); x += 4 {
+							cr += int32(row[x])
+							cb += int32(row[x+1])
+							luma += int32(row[x+2])
+						}
+					} else {
+						row := p.luma[y*p.stride+left : y*p.stride+right]
+						for _, value := range row {
+							luma += int32(value)
+						}
+						chroma := p.chroma[(y/2)*p.stride:]
+						for x := left; x < right; x++ {
+							pair := x &^ 1
+							cb += int32(chroma[pair])
+							cr += int32(chroma[pair+1])
+						}
+					}
+					sums[qx*3] += luma
+					sums[qx*3+1] += cb
+					sums[qx*3+2] += cr
+				}
+			}
+			row := plane.Pix[qy*plane.Stride:]
+			for qx := range outWidth {
+				count := int32((bottom - top) * ((qx+1)*width/outWidth - qx*width/outWidth))
+				if count == 0 {
+					continue
+				}
+				luma, cb, cr := (sums[qx*3]+count/2)/count, (sums[qx*3+1]+count/2)/count-128, (sums[qx*3+2]+count/2)/count-128
+				scaled := (luma-c.lumaOffset)*c.y + 1<<15
+				row[qx] = grayOf(int32(clamp(scaled+cr*c.rv)), int32(clamp(scaled-cb*c.gu-cr*c.gv)), int32(clamp(scaled+cb*c.bu)))
+			}
+		}
+	})
+	return turnedGray(plane, turns)
+}
+
+// quarterOfImage shrinks upright pixels to a quarter of their size by averaging blocks, in gray.
+func quarterOfImage(source image.Image) *image.Gray {
+	bounds := source.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	outWidth, outHeight := max(width/4, 1), max(height/4, 1)
+	plane := image.NewGray(image.Rect(0, 0, outWidth, outHeight))
+	pixels, isColor := source.(*image.NRGBA)
+	gray, isGray := source.(*image.Gray)
+	parallel(outHeight, func(start, end int) {
+		for qy := start; qy < end; qy++ {
+			top, bottom := qy*height/outHeight, (qy+1)*height/outHeight
+			for qx := range outWidth {
+				left, right := qx*width/outWidth, (qx+1)*width/outWidth
+				var red, green, blue, count int32
+				for y := top; y < bottom; y++ {
+					for x := left; x < right; x++ {
+						switch {
+						case isColor:
+							at := pixels.PixOffset(bounds.Min.X+x, bounds.Min.Y+y)
+							red += int32(pixels.Pix[at])
+							green += int32(pixels.Pix[at+1])
+							blue += int32(pixels.Pix[at+2])
+						case isGray:
+							value := int32(gray.Pix[gray.PixOffset(bounds.Min.X+x, bounds.Min.Y+y)])
+							red, green, blue = red+value, green+value, blue+value
+						default:
+							r, g, b, _ := source.At(bounds.Min.X+x, bounds.Min.Y+y).RGBA()
+							red, green, blue = red+int32(r>>8), green+int32(g>>8), blue+int32(b>>8)
+						}
+						count++
+					}
+				}
+				if count > 0 {
+					plane.Pix[qy*plane.Stride+qx] = grayOf((red+count/2)/count, (green+count/2)/count, (blue+count/2)/count)
+				}
+			}
+		}
+	})
+	return plane
+}
+
+// turnedGray turns a gray plane clockwise by quarter turns.
+func turnedGray(plane *image.Gray, turns int) *image.Gray {
+	turns &= 3
+	if turns == 0 {
+		return plane
+	}
+	width, height := plane.Rect.Dx(), plane.Rect.Dy()
+	outWidth, outHeight := width, height
+	if turns%2 == 1 {
+		outWidth, outHeight = height, width
+	}
+	out := image.NewGray(image.Rect(0, 0, outWidth, outHeight))
+	for y := range outHeight {
+		for x := range outWidth {
+			var sx, sy int
+			switch turns {
+			case 1:
+				sx, sy = y, height-1-x
+			case 2:
+				sx, sy = width-1-x, height-1-y
+			case 3:
+				sx, sy = width-1-y, x
+			}
+			out.Pix[y*out.Stride+x] = plane.Pix[sy*plane.Stride+sx]
+		}
+	}
+	return out
+}
