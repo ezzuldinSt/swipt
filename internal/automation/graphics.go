@@ -36,12 +36,12 @@ var (
 
 var readOperations = []string{
 	"device.info", "device.state", "device.installedApplications", "device.applicationIcon", "device.pasteboard",
-	"accessibility.snapshot", "accessibility.find", "accessibility.changed",
+	"accessibility.snapshot", "accessibility.find", "accessibility.changed", "accessibility.hitTest",
 }
 
 var timelineOperations = []string{
 	"device.unlock", "device.launchApplication", "input.tap", "input.swipe", "input.drag", "input.pinch", "input.touch", "input.pressKey",
-	"input.button", "accessibility.tap", "accessibility.setText", "accessibility.perform",
+	"input.button", "accessibility.tap", "accessibility.setText", "accessibility.perform", "accessibility.scrollPage",
 }
 
 type GraphicsCall struct {
