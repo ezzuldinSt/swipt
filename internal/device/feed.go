@@ -92,6 +92,12 @@ func (f *ScreenFeed) RequestKeyFrame() {
 	f.feeds.requestKeyFrame()
 }
 
+// PixelFormat answers the pixel format the device's video stream started with, such as 444f
+// (full range) for the remote desktop mode, or 0 while none runs.
+func (f *ScreenFeed) PixelFormat() uint32 {
+	return f.feeds.pixelFormat()
+}
+
 func (f *ScreenFeed) Close() {
 	f.feeds.remove(f)
 	f.release()
@@ -137,6 +143,18 @@ func (f *screenFeeds) requestKeyFrame() {
 	case f.own != nil && f.own.stream != nil:
 		_ = f.own.stream.stream.RequestKeyFrame()
 	}
+}
+
+func (f *screenFeeds) pixelFormat() uint32 {
+	f.access.Lock()
+	defer f.access.Unlock()
+	switch {
+	case f.viewer != nil:
+		return f.viewer.stream.stream.Info().PixelFormat
+	case f.own != nil && f.own.stream != nil:
+		return f.own.stream.stream.Info().PixelFormat
+	}
+	return 0
 }
 
 func (f *screenFeeds) viewerStarted(v *videoSource) {
