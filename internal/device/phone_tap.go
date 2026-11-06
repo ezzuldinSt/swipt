@@ -45,7 +45,8 @@ func (p *Phone) SetText(ctx context.Context, ref, text string, timeout time.Dura
 
 // aimed runs act on the element once a tap at the point it answers would reach
 // it, checking again while the element is moving, disabled or behind another
-// one, until the timeout; a negative timeout waits forever and zero checks once.
+// one, until the timeout, or for coverLimit while the application's own bars
+// cover it; a negative timeout waits forever and zero checks once.
 func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, name string, act func(ctx context.Context, s *axSession, node *PhoneNode, at Point) error) (Aim, error) {
 	c, ctx, done, err := p.begin(ctx)
 	if err != nil {
@@ -67,8 +68,16 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 	if timeout >= 0 {
 		deadline = started.Add(timeout)
 	}
+	refuse := func(pending, after string, cause error) (Aim, error) {
+		p.connection.trace(started, name+".refused", pending, time.Since(started))
+		if cause == nil {
+			return s.target, E.New(pending, after)
+		}
+		return s.target, E.Extend(cause, pending, after)
+	}
 	var delay time.Duration
 	var waited string
+	var covered time.Time
 	for attempt := 1; ; attempt++ {
 		var pending string
 		err = c.ax.do(ctx, true, 0, func(ctx context.Context, client *accessibility.RemoteClient) error {
@@ -99,11 +108,18 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 			delay = pollFirst
 		}
 		if !s.animating && !deadline.IsZero() && time.Now().Add(delay).After(deadline) {
-			p.connection.trace(started, name+".refused", pending, time.Since(started))
 			if timeout == 0 {
-				return s.target, E.Extend(ErrTimeout, pending)
+				return refuse(pending, "", ErrTimeout)
 			}
-			return s.target, E.Extend(ErrTimeout, pending, "; gave up after ", timeout)
+			return refuse(pending, "; gave up after "+timeout.String(), ErrTimeout)
+		}
+		switch {
+		case !s.fixed:
+			covered = time.Time{}
+		case covered.IsZero():
+			covered = time.Now()
+		case time.Since(covered) >= coverLimit:
+			return refuse(pending, "", nil)
 		}
 		if err = sleep(ctx, delay); err != nil {
 			return s.target, err
@@ -124,7 +140,7 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, error) {
 	name := describeElement(target.AX)
 	s.target = Aim{Element: name, Point: target.Point, Secure: target.AX.Secure()}
-	s.animating, s.stale = false, false
+	s.animating, s.stale, s.fixed = false, false, false
 	if !target.HasFrame() {
 		return Point{}, "", E.New(name, " has no position on the screen; perform one of its actions instead")
 	}
@@ -134,8 +150,12 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 		return Point{}, name + " is disabled", nil
 	case !target.Shown():
 		return Point{}, name + " is off the screen", nil
-	case target.Covered:
-		return Point{}, name + " is covered", nil
+	case target.coveredInApp() && !target.Inert:
+		s.fixed = true
+		return Point{}, name + " is covered by " + target.coverText() + ", which leaves " + strconv.Itoa(int(target.shown*100)) +
+			"% of it showing; scroll it clear of that rather than tapping it blind", nil
+	case target.Covered && !target.Inert:
+		return Point{}, name + " is covered by " + target.coverText(), nil
 	}
 	s.stale = false
 	at := target.Point
@@ -198,6 +218,11 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 	}
 	return Point{}, "a tap at " + pointText(at) + " would reach " + describeElement(hit.Value) + ", not " + name, nil
 }
+
+// An element covered by the application's own bars stays covered until the
+// script scrolls it, so a tap gives up on it once a transition would have
+// ended.
+const coverLimit = animationLimit
 
 func sameWindow(target *PhoneNode, hit accessibility.Element) bool {
 	context := hit.Context

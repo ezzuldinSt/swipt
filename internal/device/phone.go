@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -303,6 +302,11 @@ type PhoneNode struct {
 
 	model *PhoneModel
 	space axSpace
+
+	order, end  int
+	scroll, win *PhoneNode
+	cover       *PhoneNode
+	shown       float64
 }
 
 func (n *PhoneNode) HasFrame() bool {
@@ -364,23 +368,19 @@ func modelOf(geometry phoneGeometry, screen *accessibility.Screen) *PhoneModel {
 			keyboard = node
 		}
 	})
-	var over []Rect
+	var over []cover
 	if keyboard != nil {
-		over = append(over, keyboard.Visible)
+		over = append(over, cover{node: keyboard, rect: keyboard.Visible})
 		input = keyboard.window()
 	}
 	if model.System != nil {
 		walkNodes(model.System, func(node *PhoneNode) {
 			if node.Shown() && node.AX.AccessibilityElement && len(node.Children) == 0 && !node.inStatusBar() {
-				over = append(over, node.Visible)
+				over = append(over, cover{node: node, rect: node.Visible})
 			}
 		})
 	}
-	walkNodes(model.Root, func(node *PhoneNode) {
-		if node.Shown() && (input == nil || !input.Contains(node)) {
-			node.Covered = slices.ContainsFunc(over, func(rect Rect) bool { return rect.Contains(node.Point) })
-		}
-	})
+	model.uncover(over, input)
 	return model
 }
 

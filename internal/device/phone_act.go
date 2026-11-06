@@ -53,6 +53,7 @@ type axSession struct {
 	settled   time.Time
 	animating bool
 	stale     bool
+	fixed     bool
 }
 
 func (s *axSession) tap(ctx context.Context, at Point, count int, hold time.Duration) error {
