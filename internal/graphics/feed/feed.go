@@ -72,6 +72,9 @@ type Geometry struct {
 // Stats counts what the feed has done since it was made.
 type Stats struct {
 	Decoder string
+	// DecoderThread tells how the decoding thread was raised on Windows: "MMCSS Playback",
+	// "highest" or "normal".
+	DecoderThread string
 	// Color tells how the newest stream's pictures are converted: where the range came from,
 	// and the H.273 code points of the stream's VUI.
 	Color            string
@@ -130,7 +133,7 @@ type Feed struct {
 	failure   error
 
 	frames, converted, dropped, damaged, requests atomic.Int64
-	decoderName, colorName                        atomic.Pointer[string]
+	decoderName, colorName, threadPriority        atomic.Pointer[string]
 	prewarming                                    atomic.Bool
 	clock                                         feedClock
 	decoding, converting, answering               timing
@@ -238,6 +241,9 @@ func (f *Feed) Stats() Stats {
 	}
 	if name := f.colorName.Load(); name != nil {
 		stats.Color = *name
+	}
+	if name := f.threadPriority.Load(); name != nil {
+		stats.DecoderThread = *name
 	}
 	stats.Decoding, stats.Converting, stats.Answering = f.decoding.read(), f.converting.read(), f.answering.read()
 	stats.Units, stats.UnitBytes = f.units.Load(), f.unitBytes.Load()
@@ -800,10 +806,14 @@ func (s *session) stop() {
 
 func (s *session) run(opened screen) {
 	defer close(s.finished)
-	// Media Foundation's objects live on this thread.
+	// Media Foundation's objects live on this thread, which runs above the others while it
+	// decodes.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	f := s.feed
+	priority, restore := raiseThreadPriority()
+	defer restore()
+	f.threadPriority.Store(&priority)
 	decoder := newFrameDecoder(f.newCodec, f.options, f.logger, func(picture *picture, unit *AccessUnit) {
 		f.decoded(s, picture, unit)
 	})
