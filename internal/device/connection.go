@@ -86,6 +86,11 @@ type Options struct {
 	DiskImageDirectory        string
 	IdleTimeout               time.Duration
 	DeferAccessibilityRestart bool
+
+	// Moved, when set, reports whether a new connection would reach the device
+	// another way than the connected one; that one is then replaced. It is
+	// asked every routeCheckInterval.
+	Moved func(ctx context.Context, device *coredevice.Device) bool
 }
 
 type Settings struct {
@@ -645,7 +650,7 @@ func (s *Connection) serveDevice(session context.Context, device *coredevice.Dev
 func (s *Connection) watchRoute(session context.Context, device *coredevice.Device) error {
 	local, remote := device.TransportAddr()
 	var tick <-chan time.Time
-	if local.IsValid() && remote.IsValid() {
+	if local.IsValid() && remote.IsValid() || s.options.Moved != nil {
 		ticker := time.NewTicker(routeCheckInterval)
 		defer ticker.Stop()
 		tick = ticker.C
@@ -657,6 +662,12 @@ func (s *Connection) watchRoute(session context.Context, device *coredevice.Devi
 		case <-session.Done():
 			return nil
 		case <-tick:
+		}
+		if s.options.Moved != nil && s.options.Moved(session, device) {
+			return errRerouted
+		}
+		if !local.IsValid() || !remote.IsValid() {
+			continue
 		}
 		conn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(remote))
 		if err != nil {
