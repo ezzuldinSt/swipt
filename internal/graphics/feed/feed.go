@@ -360,6 +360,7 @@ func (f *Feed) closeIfIdle() {
 	stopping.stop()
 	// A stream goes through some 30 MB of frames a second, which the Go runtime would keep
 	// from the system long after the stream stopped.
+	dropSpareBuffers()
 	go debug.FreeOSMemory()
 }
 
@@ -389,6 +390,7 @@ func (f *Feed) Close() {
 	stopping.stop()
 	// A stream goes through some 30 MB of frames a second, which the Go runtime would keep
 	// from the system long after the stream stopped.
+	dropSpareBuffers()
 	go debug.FreeOSMemory()
 }
 
@@ -559,8 +561,12 @@ func (l *Lease) check() error {
 	return nil
 }
 
+// answer makes an image of a frame the caller holds, which the image then holds.
 func (l *Lease) answer(ctx context.Context, answered *frame, sequence int64) (*raster.Image, error) {
-	defer answered.release()
+	if ctx.Err() != nil {
+		answered.release()
+		return nil, &raster.Error{Name: raster.NameAbort, Message: "the operation was aborted"}
+	}
 	l.access.Lock()
 	l.sequence = max(l.sequence, sequence)
 	if l.hasAnswered {
@@ -572,7 +578,7 @@ func (l *Lease) answer(ctx context.Context, answered *frame, sequence int64) (*r
 	}
 	l.hasAnswered, l.answered, l.answeredTotals = true, answered.info, answered.totals
 	l.access.Unlock()
-	return answered.image(ctx)
+	return answered.image(), nil
 }
 
 // Repeated tells whether the units since the frame the lease answered before the last one tell
@@ -634,9 +640,9 @@ func (l *Lease) Next(ctx context.Context, until time.Time) (*raster.Image, error
 }
 
 // frame is a decoded picture with the arrival of its first packet in milliseconds since the
-// epoch, the quarter turns that make it upright and the screen it belongs to (SWFrame.m). Its
-// RGBA image is made once, when a lease first answers it; the picture's bytes go back to the
-// pool when no one holds the frame or the image is made.
+// epoch, the quarter turns that make it upright and the screen it belongs to (SWFrame.m). Every
+// image a lease answers of it holds it and converts only what a call reads; the picture's bytes
+// go back to the pool when no one holds the frame.
 type frame struct {
 	feed *Feed
 	time float64
@@ -648,10 +654,11 @@ type frame struct {
 	refs              atomic.Int32
 	info              FrameInfo
 	totals            unitTotals
+	// answered is set once a conversion of the frame was timed from its arrival.
+	answered atomic.Bool
 
 	access  sync.Mutex
 	picture *picture
-	made    *raster.Image
 	quarter *image.Gray
 }
 
@@ -684,6 +691,19 @@ func (fr *Frame) Release() {
 	}
 }
 
+// Same tells whether two frames that are not released decoded to the same samples, which
+// means the same screen pixel for pixel.
+func (fr *Frame) Same(other *Frame) bool {
+	if fr.released.Load() || other.released.Load() {
+		return false
+	}
+	if fr.frame == other.frame {
+		return true
+	}
+	a, b := fr.frame, other.frame
+	return a.turns == b.turns && a.geometry == b.geometry && a.picture != nil && b.picture != nil && a.picture.same(b.picture)
+}
+
 // Quarter answers the frame cropped to the screen and shrunk to a quarter of its size, in gray
 // and turned upright, which the change tracker of a recording compares (SWFrame.m quarter:).
 // It is made once.
@@ -697,19 +717,11 @@ func (fr *Frame) Quarter(ctx context.Context) (*image.Gray, error) {
 	if f.quarter != nil {
 		return f.quarter, nil
 	}
-	switch {
-	case f.picture != nil:
-		width, height := f.cropSize(f.picture.width, f.picture.height)
-		f.quarter = f.picture.quarterGray(width, height, f.turns)
-	case f.made != nil:
-		pixels, err := f.made.Pixels(ctx)
-		if err != nil {
-			return nil, err
-		}
-		f.quarter = quarterOfImage(pixels)
-	default:
+	if f.picture == nil {
 		return nil, &raster.Error{Name: raster.NameUnavailable, Message: "graphics: the frame is gone"}
 	}
+	width, height := f.cropSize(f.picture.width, f.picture.height)
+	f.quarter = f.picture.quarterGray(width, height, f.turns)
 	return f.quarter, nil
 }
 
@@ -735,35 +747,72 @@ func (fr *frame) release() {
 	}
 }
 
-// image converts the frame to RGBA in points of the screen, cropped to the screen's size and
-// turned upright, with the arrival as its timestamp (SWImageNode.m nodeWithFrame:).
-func (fr *frame) image(ctx context.Context) (*raster.Image, error) {
-	fr.access.Lock()
-	defer fr.access.Unlock()
-	if fr.made != nil {
-		return fr.made, nil
+// image is the frame in points of the screen, cropped to the screen's size and turned upright,
+// with the arrival as its timestamp (SWImageNode.m nodeWithFrame:). It takes over a hold on
+// the frame, and makes its pixels as calls read them.
+func (fr *frame) image() *raster.Image {
+	width, height := fr.cropSize(fr.picture.width, fr.picture.height)
+	width, height = fr.picture.uprightSize(width, height, fr.turns)
+	return raster.FromSource(width, height, fr.geometry.Scale, fr.time, &frameSource{frame: fr})
+}
+
+// frameSource is a hold on a frame that makes an image's pixels (raster.Source).
+type frameSource struct {
+	frame    *frame
+	released atomic.Bool
+}
+
+func (s *frameSource) Share() raster.Source {
+	s.frame.refs.Add(1)
+	return &frameSource{frame: s.frame}
+}
+
+func (s *frameSource) Release() {
+	if s.released.CompareAndSwap(false, true) {
+		s.frame.release()
 	}
+}
+
+func (s *frameSource) picture() (*picture, int, int, error) {
+	fr := s.frame
+	if s.released.Load() || fr.picture == nil {
+		return nil, 0, 0, &raster.Error{Name: raster.NameUnavailable, Message: "graphics: the frame is gone"}
+	}
+	width, height := fr.cropSize(fr.picture.width, fr.picture.height)
+	return fr.picture, width, height, nil
+}
+
+func (s *frameSource) Pixels(ctx context.Context, rect image.Rectangle, out []byte) error {
 	if ctx.Err() != nil {
-		return nil, &raster.Error{Name: raster.NameAbort, Message: "the operation was aborted"}
+		return &raster.Error{Name: raster.NameAbort, Message: "the operation was aborted"}
 	}
-	if fr.picture == nil {
-		return nil, &raster.Error{Name: raster.NameUnavailable, Message: "graphics: the frame is gone"}
+	p, width, height, err := s.picture()
+	if err != nil {
+		return err
 	}
+	fr := s.frame
 	f := fr.feed
 	started := f.clock.ticks()
-	width, height := fr.cropSize(fr.picture.width, fr.picture.height)
-	pixels := fr.picture.rgba(width, height, fr.turns)
-	fr.made = raster.FromImage(pixels, fr.geometry.Scale, fr.time)
-	recycleRGBA(pixels)
-	fr.picture.recycle()
-	fr.picture = nil
+	p.rgbaInto(out, rect, width, height, fr.turns)
 	f.converted.Add(1)
 	finished := f.clock.ticks()
 	f.converting.add(time.Duration(finished - started))
-	if fr.received != 0 {
+	if fr.received != 0 && fr.answered.CompareAndSwap(false, true) {
 		f.answering.add(time.Duration(finished - fr.received))
 	}
-	return fr.made, nil
+	return nil
+}
+
+func (s *frameSource) Gray(ctx context.Context, rect image.Rectangle, outWidth, outHeight int, out []byte) error {
+	if ctx.Err() != nil {
+		return &raster.Error{Name: raster.NameAbort, Message: "the operation was aborted"}
+	}
+	p, width, height, err := s.picture()
+	if err != nil {
+		return err
+	}
+	p.grayInto(out, rect, width, height, s.frame.turns, outWidth, outHeight)
+	return nil
 }
 
 // session is one opening of the stream: its batches, and the goroutine that depacketizes and

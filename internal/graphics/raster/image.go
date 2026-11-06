@@ -30,6 +30,11 @@ type Image struct {
 	parent    *Image
 	operation func(input *raster) *raster
 	cached    *raster
+	// window is the part of a Source the image shows while its pixels are not made; released
+	// is set once Release let everything go.
+	window     Source
+	windowRect image.Rectangle
+	released   bool
 
 	// printed is the feature print of distance and nearest, made once (feature.go).
 	printAccess sync.Mutex
@@ -160,12 +165,21 @@ func (m *Image) PixelRect(r Rect) (image.Rectangle, error) {
 	return image.Rect(int(left), int(top), int(right), int(bottom)), nil
 }
 
-// Crop cuts a rectangle of the image's space; the result shares the pixels.
+// Crop cuts a rectangle of the image's space; the result shares the pixels, or the source that
+// makes them, of which it makes only its own.
 func (m *Image) Crop(r Rect) (*Image, error) {
 	pixels, err := m.PixelRect(r)
 	if err != nil {
 		return nil, err
 	}
+	m.access.Lock()
+	if m.cached == nil && m.window != nil {
+		node := newImage(pixels.Dx(), pixels.Dy(), translation(float64(pixels.Min.X), float64(pixels.Min.Y)).then(m.transform), m.gray, m.time, m.timestamp)
+		node.window, node.windowRect = m.window.Share(), pixels.Add(m.windowRect.Min)
+		m.access.Unlock()
+		return node, nil
+	}
+	m.access.Unlock()
 	return m.derive(func(input *raster) *raster {
 		return input.view(pixels.Min.X, pixels.Min.Y, pixels.Dx(), pixels.Dy())
 	}, pixels.Dx(), pixels.Dy(), translation(float64(pixels.Min.X), float64(pixels.Min.Y)).then(m.transform), m.gray), nil
@@ -309,6 +323,19 @@ func (m *Image) render(ctx context.Context) (*raster, error) {
 }
 
 func (m *Image) renderLocked(ctx context.Context) (*raster, error) {
+	if m.released {
+		return nil, m.gone()
+	}
+	if m.window != nil {
+		r, err := m.windowPixels(ctx, image.Rect(0, 0, m.pixelWidth, m.pixelHeight))
+		if err != nil {
+			return nil, err
+		}
+		// The pixels are all made, so the source can go back.
+		m.window.Release()
+		m.cached, m.window = r, nil
+		return r, nil
+	}
 	if m.source != nil {
 		r, err := m.source(ctx)
 		if err != nil {
@@ -330,12 +357,25 @@ func (m *Image) renderLocked(ctx context.Context) (*raster, error) {
 	return m.operation(input), nil
 }
 
+// rasterIn answers the pixels under a region, or all of them when region is nil, and where they
+// start; an image that has a source makes only the region's, and does not keep them.
 func (m *Image) rasterIn(ctx context.Context, region *Rect) (*raster, image.Point, error) {
-	r, err := m.raster(ctx)
-	if err != nil || region == nil {
+	if region == nil {
+		r, err := m.raster(ctx)
 		return r, image.Point{}, err
 	}
 	pixels, err := m.PixelRect(*region)
+	if err != nil {
+		return nil, image.Point{}, err
+	}
+	m.access.Lock()
+	if m.cached == nil && m.window != nil && pixels != image.Rect(0, 0, m.pixelWidth, m.pixelHeight) {
+		defer m.access.Unlock()
+		r, err := m.windowPixels(ctx, pixels)
+		return r, pixels.Min, err
+	}
+	m.access.Unlock()
+	r, err := m.raster(ctx)
 	if err != nil {
 		return nil, image.Point{}, err
 	}

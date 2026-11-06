@@ -1,9 +1,13 @@
 package feed
 
 import (
+	"bytes"
 	"image"
 	"runtime"
 	"sync"
+	"sync/atomic"
+
+	"github.com/swipt-automation/swipt/internal/graphics/raster"
 )
 
 // colorMatrix is the YCbCr to RGB matrix of a stream (MFVideoTransferMatrix, H.273
@@ -51,8 +55,52 @@ type picture struct {
 	buffer *[]byte
 }
 
-// picturePool recycles the bytes of pictures, which come at up to 60 a second.
-var picturePool sync.Pool
+// spareBuffers is how many pictures' bytes the pool keeps for the next pictures. The feed holds
+// its newest frame, a wait the frame it compares and the one it answers, and the screenshot
+// cache the frame before; more spares would only keep memory from the system. A device picture
+// is 15 MB (1320x2868 AYUV).
+const spareBuffers = 4
+
+// pictureBuffers recycles the bytes of pictures, which come at up to 60 a second. Unlike a
+// sync.Pool it keeps them across garbage collections, and at most spareBuffers of them.
+var pictureBuffers struct {
+	access sync.Mutex
+	spare  []*[]byte
+}
+
+func takeBuffer(size int) *[]byte {
+	pictureBuffers.access.Lock()
+	for count := len(pictureBuffers.spare); count > 0; count = len(pictureBuffers.spare) {
+		buffer := pictureBuffers.spare[count-1]
+		pictureBuffers.spare[count-1] = nil
+		pictureBuffers.spare = pictureBuffers.spare[:count-1]
+		// A buffer of another size belongs to a stream that is gone.
+		if cap(*buffer) >= size && cap(*buffer) <= size+size/4 {
+			pictureBuffers.access.Unlock()
+			*buffer = (*buffer)[:size]
+			return buffer
+		}
+	}
+	pictureBuffers.access.Unlock()
+	made := make([]byte, size)
+	return &made
+}
+
+func giveBuffer(buffer *[]byte) {
+	pictureBuffers.access.Lock()
+	defer pictureBuffers.access.Unlock()
+	if len(pictureBuffers.spare) < spareBuffers {
+		pictureBuffers.spare = append(pictureBuffers.spare, buffer)
+	}
+}
+
+// dropSpareBuffers lets the system have the spare bytes back, as when the stream closes.
+func dropSpareBuffers() {
+	pictureBuffers.access.Lock()
+	defer pictureBuffers.access.Unlock()
+	clear(pictureBuffers.spare)
+	pictureBuffers.spare = pictureBuffers.spare[:0]
+}
 
 // newPicture allocates a width by height picture whose planes the decoder fills; rows is the
 // rows of the luma plane. An NV12 stride covers every chroma pair, so it is even.
@@ -65,14 +113,7 @@ func newPicture(layout pixelLayout, width, height, stride, rows int) *picture {
 		stride = max(stride, (width+1)&^1)
 		size = stride*rows + stride*((rows+1)/2)
 	}
-	var buffer *[]byte
-	if pooled, ok := picturePool.Get().(*[]byte); ok && cap(*pooled) >= size {
-		buffer = pooled
-		*buffer = (*buffer)[:size]
-	} else {
-		made := make([]byte, size)
-		buffer = &made
-	}
+	buffer := takeBuffer(size)
 	p := &picture{layout: layout, width: width, height: height, stride: stride, luma: *buffer, buffer: buffer}
 	if layout == layoutNV12 {
 		p.luma, p.chroma = (*buffer)[:stride*rows], (*buffer)[stride*rows:]
@@ -83,9 +124,32 @@ func newPicture(layout pixelLayout, width, height, stride, rows int) *picture {
 // recycle returns the bytes to the pool; the picture must not be read afterwards.
 func (p *picture) recycle() {
 	if p.buffer != nil {
-		picturePool.Put(p.buffer)
+		giveBuffer(p.buffer)
 		p.buffer, p.luma, p.chroma = nil, nil, nil
 	}
+}
+
+// same tells whether two pictures hold the same samples.
+func (p *picture) same(other *picture) bool {
+	if p.layout != other.layout || p.width != other.width || p.height != other.height || p.stride != other.stride ||
+		len(p.luma) != len(other.luma) || len(p.chroma) != len(other.chroma) {
+		return false
+	}
+	if !bytes.Equal(p.chroma, other.chroma) {
+		return false
+	}
+	// Bands compare at once; a change is usually found in the first band that holds it.
+	var differ atomic.Bool
+	rows := len(p.luma) / max(p.stride, 1)
+	parallel(rows, func(start, end int) {
+		for y := start; y < end && !differ.Load(); y += 64 {
+			stop := min(y+64, end)
+			if !bytes.Equal(p.luma[y*p.stride:stop*p.stride], other.luma[y*p.stride:stop*p.stride]) {
+				differ.Store(true)
+			}
+		}
+	})
+	return !differ.Load() && bytes.Equal(p.luma[rows*p.stride:], other.luma[rows*p.stride:])
 }
 
 // coefficients are the matrix in 16.16 fixed point with the range folded in: R = Y·y + Cr·rv,
@@ -194,44 +258,66 @@ func (p *picture) sample(x, y int) (luma, cb, cr int32) {
 // quarter turns, as SWFrame.m crops the pixel buffer and rotates the raster. The rows are
 // shared among the processors.
 func (p *picture) rgba(width, height, turns int) *image.NRGBA {
-	out := p.converted(width, height, turns)
-	if conversion := p.conversionToSRGB(); conversion != nil {
-		conversion.ConvertNRGBA(out)
-	}
+	width, height = min(width, p.width), min(height, p.height)
+	outWidth, outHeight := p.uprightSize(width, height, turns)
+	out := newRGBA(outWidth, outHeight)
+	p.rgbaInto(out.Pix, image.Rect(0, 0, outWidth, outHeight), width, height, turns)
 	return out
 }
 
-func (p *picture) converted(width, height, turns int) *image.NRGBA {
+// uprightSize is the size of the top-left width by height of the picture turned upright.
+func (p *picture) uprightSize(width, height, turns int) (int, int) {
 	width, height = min(width, p.width), min(height, p.height)
-	turns &= 3
-	outWidth, outHeight := width, height
-	if turns%2 == 1 {
-		outWidth, outHeight = height, width
+	if turns&1 == 1 {
+		return height, width
 	}
-	out := newRGBA(outWidth, outHeight)
-	c := coefficientsOf(p.matrix, p.fullRange)
-	// The source pixel of (x, y) in the output is origin + x·across + y·down (raster.remapped).
-	var origin, across, down [2]int
-	switch turns {
-	case 0:
-		origin, across, down = [2]int{0, 0}, [2]int{1, 0}, [2]int{0, 1}
+	return width, height
+}
+
+// rgbaInto converts rect of the upright output of the top-left width by height of the picture,
+// turned clockwise by quarter turns, into out, rect.Dx()·4 bytes a row, in sRGB.
+func (p *picture) rgbaInto(out []byte, rect image.Rectangle, width, height, turns int) {
+	p.convertInto(out, rect, min(width, p.width), min(height, p.height), turns)
+	if conversion := p.conversionToSRGB(); conversion != nil {
+		conversion.ConvertNRGBA(&image.NRGBA{Pix: out, Stride: rect.Dx() * 4, Rect: image.Rect(0, 0, rect.Dx(), rect.Dy())})
+	}
+}
+
+// turning maps the output of a quarter turn back to the picture: the source pixel of (x, y) in
+// the upright output of the top-left width by height is origin + x·across + y·down
+// (raster.remapped).
+func turning(width, height, turns int) (origin, across, down [2]int) {
+	switch turns & 3 {
 	case 1:
-		origin, across, down = [2]int{0, height - 1}, [2]int{0, -1}, [2]int{1, 0}
+		return [2]int{0, height - 1}, [2]int{0, -1}, [2]int{1, 0}
 	case 2:
-		origin, across, down = [2]int{width - 1, height - 1}, [2]int{-1, 0}, [2]int{0, -1}
+		return [2]int{width - 1, height - 1}, [2]int{-1, 0}, [2]int{0, -1}
 	case 3:
-		origin, across, down = [2]int{width - 1, 0}, [2]int{0, 1}, [2]int{-1, 0}
+		return [2]int{width - 1, 0}, [2]int{0, 1}, [2]int{-1, 0}
 	}
-	parallel(outHeight, func(start, end int) {
+	return [2]int{0, 0}, [2]int{1, 0}, [2]int{0, 1}
+}
+
+// convertInto converts rect of the upright output of the top-left width by height of the
+// picture into out, without changing its colors' primaries.
+func (p *picture) convertInto(out []byte, rect image.Rectangle, width, height, turns int) {
+	turns &= 3
+	c := coefficientsOf(p.matrix, p.fullRange)
+	origin, across, down := turning(width, height, turns)
+	rowBytes := rect.Dx() * 4
+	parallel(rect.Dy(), func(start, end int) {
 		for y := start; y < end; y++ {
-			row := out.Pix[y*out.Stride : y*out.Stride+outWidth*4]
+			row := out[y*rowBytes : (y+1)*rowBytes]
+			sourceY := rect.Min.Y + y
 			switch {
 			case turns == 0 && p.layout == layoutAYUV && !c.general:
-				convertAYUVRow(row, p.luma[y*p.stride:y*p.stride+outWidth*4], &c)
-			case turns == 0 && !c.general:
-				p.convertRow(row, y, &c)
+				at := sourceY*p.stride + rect.Min.X*4
+				convertAYUVRow(row, p.luma[at:at+rowBytes], &c)
+			case turns == 0 && rect.Min.X == 0 && !c.general:
+				p.convertRow(row, sourceY, &c)
 			default:
-				sx, sy := origin[0]+y*down[0], origin[1]+y*down[1]
+				sx := origin[0] + rect.Min.X*across[0] + sourceY*down[0]
+				sy := origin[1] + rect.Min.X*across[1] + sourceY*down[1]
 				for x := 0; x < len(row); x += 4 {
 					luma, cb, cr := p.sample(sx, sy)
 					c.put(row[x:x+4:x+4], luma, cb, cr)
@@ -241,7 +327,74 @@ func (p *picture) converted(width, height, turns int) *image.NRGBA {
 			}
 		}
 	})
-	return out
+}
+
+// grayInto shrinks rect of the upright output of the top-left width by height of the picture to
+// outWidth by outHeight by averaging blocks, in sRGB gray, into out (raster.Source's Gray). An
+// upright picture is averaged in Y, Cb and Cr, which is averaging its colors as the conversion is
+// linear before it clamps; a turned one is converted first.
+func (p *picture) grayInto(out []byte, rect image.Rectangle, width, height, turns, outWidth, outHeight int) {
+	if turns&3 != 0 {
+		pixels := make([]byte, rect.Dx()*rect.Dy()*4)
+		p.rgbaInto(pixels, rect, width, height, turns)
+		raster.AveragedGray(&image.NRGBA{Pix: pixels, Stride: rect.Dx() * 4, Rect: image.Rect(0, 0, rect.Dx(), rect.Dy())}, outWidth, outHeight, out)
+		return
+	}
+	c := coefficientsOf(p.matrix, p.fullRange)
+	conversion := p.conversionToSRGB()
+	rectWidth, rectHeight := rect.Dx(), rect.Dy()
+	parallel(outHeight, func(start, end int) {
+		sums := make([]int32, outWidth*3)
+		colors := make([]byte, outWidth*4)
+		for qy := start; qy < end; qy++ {
+			clear(sums)
+			top, bottom := rect.Min.Y+qy*rectHeight/outHeight, rect.Min.Y+(qy+1)*rectHeight/outHeight
+			for y := top; y < bottom; y++ {
+				for qx := range outWidth {
+					left, right := rect.Min.X+qx*rectWidth/outWidth, rect.Min.X+(qx+1)*rectWidth/outWidth
+					var luma, cb, cr int32
+					if p.layout == layoutAYUV {
+						row := p.luma[y*p.stride+left*4 : y*p.stride+right*4]
+						for x := 0; x+3 < len(row); x += 4 {
+							cr += int32(row[x])
+							cb += int32(row[x+1])
+							luma += int32(row[x+2])
+						}
+					} else {
+						for _, value := range p.luma[y*p.stride+left : y*p.stride+right] {
+							luma += int32(value)
+						}
+						chroma := p.chroma[(y/2)*p.stride:]
+						for x := left; x < right; x++ {
+							pair := x &^ 1
+							cb += int32(chroma[pair])
+							cr += int32(chroma[pair+1])
+						}
+					}
+					sums[qx*3] += luma
+					sums[qx*3+1] += cb
+					sums[qx*3+2] += cr
+				}
+			}
+			for qx := range outWidth {
+				count := int32((bottom - top) * ((qx+1)*rectWidth/outWidth - qx*rectWidth/outWidth))
+				pixel := colors[qx*4 : qx*4+4 : qx*4+4]
+				if count == 0 {
+					pixel[0], pixel[1], pixel[2], pixel[3] = 0, 0, 0, 255
+					continue
+				}
+				pixel[0], pixel[1], pixel[2] = c.rgb((sums[qx*3]+count/2)/count, (sums[qx*3+1]+count/2)/count, (sums[qx*3+2]+count/2)/count)
+				pixel[3] = 255
+			}
+			if conversion != nil {
+				conversion.ConvertNRGBA(&image.NRGBA{Pix: colors, Stride: outWidth * 4, Rect: image.Rect(0, 0, outWidth, 1)})
+			}
+			row := out[qy*outWidth : (qy+1)*outWidth]
+			for qx := range outWidth {
+				row[qx] = grayOf(int32(colors[qx*4]), int32(colors[qx*4+1]), int32(colors[qx*4+2]))
+			}
+		}
+	})
 }
 
 // convertAYUVRow converts an upright row of V, U, Y, A pixels into R, G, B, A ones of the same
