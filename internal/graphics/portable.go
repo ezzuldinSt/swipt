@@ -625,6 +625,11 @@ func (v environment) Screenshot(context.Context) ([]byte, float64, error) {
 	return v.call.Screenshot()
 }
 
+// LastInput makes screen waits right after input give the screen time to answer it.
+func (v environment) LastInput() time.Time {
+	return v.call.LastInput()
+}
+
 func (v environment) Tracing() bool {
 	return v.call.Tracing()
 }

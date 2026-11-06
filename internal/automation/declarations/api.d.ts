@@ -632,6 +632,14 @@ declare module "@swipt/api/screen" {
     readonly region?: Rect;
     readonly timeoutMs?: number;
     readonly threshold?: number;
+    /**
+     * A change whose changed pixels lie in at most four spots, each changing no more than an
+     * ignoreSize by ignoreSize square of points, does not count. waitForStable ignores 12 by
+     * default, so a blinking caret, a clock hand or a digit of the status bar does not keep the
+     * screen moving; waitForChange counts every change by default. 0 counts every change. The
+     * macOS engine does not read it yet.
+     */
+    readonly ignoreSize?: number;
   }
 
   export interface ScreenChange {
@@ -782,6 +790,12 @@ declare module "@swipt/api/screen" {
     readonly element?: AccessibilityElement;
   }
 
+  /**
+   * A lossless PNG of the screen from the device. Where the engine streams the screen (not on
+   * macOS yet), a PNG taken earlier answers at once while the stream shows the screen unchanged
+   * since it began, down to the last pixel; one is taken in the background once the screen has
+   * stood still for half a second.
+   */
   export function screenshot(options?: CallOptions): Promise<RasterImage>;
   export function find(
     target: ScreenTarget | readonly ScreenTarget[],
@@ -800,9 +814,22 @@ declare module "@swipt/api/screen" {
     predicate: (frame: RasterImage) => boolean | Promise<boolean>,
     options?: CallOptions & { readonly timeoutMs?: number },
   ): Promise<RasterImage>;
+  /**
+   * The first frame that differs from `from`, or else from the latest frame, in at least
+   * 1/5000 of the region's pixels by `threshold` gray levels (24), compared at a quarter of their
+   * size. It answers as soon as the changed frame is decoded.
+   */
   export function waitForChange(
     options?: WaitOptions & { readonly from?: RasterImage },
   ): Promise<RasterImage>;
+  /**
+   * The latest frame once the screen has not changed for `durationMs`: 100 ms by default (500 ms
+   * on macOS), timed by the frames' arrival and over three frames at least. Each frame is compared
+   * with the first of the quiet stretch, so a slow fade or the tail of a scroll counts. Small
+   * changes that `ignoreSize` lets pass in three frames running lengthen the stretch by 200 ms,
+   * and right after input the screen gets 400 ms to answer before an unchanged one counts as
+   * settled.
+   */
   export function waitForStable(
     options?: WaitOptions & { readonly durationMs?: number },
   ): Promise<RasterImage>;
