@@ -76,10 +76,18 @@ func (e *engine) match(arguments []jsc.Value) (any, error) {
 			return nil, err
 		}
 		callbacks := scriptCallbacks{engine: e, callback: arguments[4]}
-		if mode == "all" {
+		var element *device.ViewElement
+		switch mode {
+		case "all":
 			return view.FindAll(scope, selector, callbacks)
+		case "best":
+			found, err := view.Best(scope, selector, callbacks)
+			return found[:min(len(found), 1)], err
+		case "unique":
+			element, err = view.Unique(scope, selector, callbacks)
+		default:
+			element, err = view.Find(scope, selector, callbacks)
 		}
-		element, err := view.Find(scope, selector, callbacks)
 		if element == nil {
 			return nil, err
 		}

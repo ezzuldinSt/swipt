@@ -27,7 +27,7 @@ export interface Native {
     snapshot: string,
     scope: string,
     json: string,
-    mode: "one" | "all",
+    mode: "one" | "all" | "best" | "unique",
     call: (kind: string, id: string, value: string) => string,
   ): { elements?: Raw[]; failure?: string; thrown?: boolean };
   preferredLocalizations(localizations: string): string[];

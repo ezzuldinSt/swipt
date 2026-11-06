@@ -400,25 +400,28 @@ declare module "@swipt/api/accessibility" {
   export function snapshot(
     options?: SnapshotOptions,
   ): Promise<AccessibilitySnapshot>;
+  /** Of several matches, answers the one an action most likely means, preferring in turn one that shows on the screen, one nothing covers, an enabled one, a control, and one at least twice the size of the others; among matches alike, the first in the tree. */
   export function find(
     selector: AccessibilitySelector | readonly AccessibilitySelector[],
     options?: FindOptions,
   ): Promise<AccessibilityElement | null>;
   export interface ElementOptions extends CallOptions {
+    /** With a selector, also the time to wait for a match. */
     readonly timeoutMs?: number;
   }
 
+  /** A selector picks its match as find does, and throws when several rank alike, listing them. */
   export function tap(
-    element: AccessibilityElement,
+    element: AccessibilityElement | AccessibilitySelector,
     options?: ElementOptions,
   ): Promise<void>;
   export function setText(
-    element: AccessibilityElement,
+    element: AccessibilityElement | AccessibilitySelector,
     text: string,
     options?: ElementOptions,
   ): Promise<void>;
   export function perform(
-    element: AccessibilityElement,
+    element: AccessibilityElement | AccessibilitySelector,
     action: AccessibilityAction | (string & {}),
     options?: CallOptions,
   ): Promise<void>;

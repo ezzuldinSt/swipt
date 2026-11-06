@@ -4,6 +4,7 @@ import {
   AccessibilityElement,
   encode,
   isSelector,
+  pick,
   refOf,
   snapshotOf,
   type RawSnapshot,
@@ -48,8 +49,11 @@ const view = (options: unknown) => {
   if (scope !== undefined) {
     throw new TypeError("scope and within are exclusive");
   }
+  if (!(within instanceof AccessibilityElement)) {
+    throw new TypeError("within takes an element of a snapshot");
+  }
   return {
-    within: elementOf(within, "within"),
+    within: refOf(within),
     full,
     depth: depthOf(depth),
   };
@@ -85,54 +89,31 @@ const limitOf = (value: unknown, name: string): number => {
   return value;
 };
 
-const elementOf = (element: unknown, operation: string): string => {
-  if (!(element instanceof AccessibilityElement)) {
-    throw new TypeError(`${operation} takes an element of a snapshot`);
-  }
-  return refOf(element);
-};
-
 interface Found {
   snapshot: RawSnapshot | null;
   seen: number;
   failure?: string;
 }
 
-export const snapshot = async (options?: Options) =>
-  snapshotOf(
-    await invoke<RawSnapshot>("accessibility.snapshot", [view(options)], {
-      signal: signalOf(options),
-    }),
-  );
+interface Search {
+  mode: "best" | "unique";
+  timeout: number;
+  pollLimit: number;
+  signal?: AbortSignal;
+  depth?: number;
+}
 
-export const find = async (
-  selector: unknown,
-  options?: Options,
+// locate reads the screen until one of the selectors matches, taking the
+// match the ranking puts first; in "unique" mode a tie throws.
+const locate = async (
+  selectors: Selector[],
+  { mode, timeout, pollLimit, signal, depth }: Search,
 ): Promise<AccessibilityElement | null> => {
-  const selectors = selectorsOf(selector);
-  const {
-    timeoutMs,
-    poll = false,
-    pollTimeoutMs,
-    depth,
-  } = optionsOf(options, ["timeoutMs", "poll", "pollTimeoutMs", "depth"]);
-  const read = { depth: depthOf(depth) };
-  const timeout = limitOf(timeoutMs, "timeoutMs");
-  if (typeof poll !== "boolean") {
-    throw new TypeError("poll must be a boolean");
-  }
-  if (pollTimeoutMs !== undefined && !poll) {
-    throw new TypeError("pollTimeoutMs applies with poll");
-  }
-  const pollLimit =
-    pollTimeoutMs === undefined
-      ? Infinity
-      : limitOf(pollTimeoutMs, "pollTimeoutMs");
-  const signal = signalOf(options);
   const encoded = selectors.map((item) => encode(item).value);
+  const read = { depth };
   const started = Date.now();
   const deadline = started + timeout;
-  const pollUntil = poll ? started + pollLimit : -Infinity;
+  const pollUntil = started + pollLimit;
   for (;;) {
     const found = await invoke<Found>("accessibility.find", [encoded, read], {
       signal,
@@ -140,8 +121,8 @@ export const find = async (
     if (found.snapshot !== null) {
       const taken = snapshotOf(found.snapshot);
       for (const item of selectors) {
-        const element = taken.findAll(item)[0];
-        if (element !== undefined) {
+        const element = pick(taken, item, mode);
+        if (element !== null) {
           return element;
         }
       }
@@ -164,28 +145,107 @@ export const find = async (
   }
 };
 
+const elementOf = (element: unknown, operation: string): string | Selector => {
+  if (element instanceof AccessibilityElement) {
+    return refOf(element);
+  }
+  if (!isSelector(element)) {
+    throw new TypeError(
+      `${operation} takes an element of a snapshot or a selector`,
+    );
+  }
+  return element;
+};
+
+// on runs an action on an element, or on the one element a selector means,
+// found within the time limit, with the time left.
+const on = (
+  element: string | Selector,
+  operation: string,
+  limit: number,
+  options: unknown,
+  run: (ref: string, limit: number) => Promise<void>,
+): Promise<void> => {
+  if (typeof element === "string") {
+    return run(element, limit);
+  }
+  const started = Date.now();
+  return locate([element], {
+    mode: "unique",
+    timeout: limit,
+    pollLimit: -Infinity,
+    signal: signalOf(options),
+  }).then((found) => {
+    if (found === null) {
+      throw errorFrom({
+        name: "NotFoundError",
+        message: `${operation}: no element matches the selector${limit > 0 ? ` within ${limit} ms` : ""}`,
+      });
+    }
+    return run(refOf(found), Math.max(limit - (Date.now() - started), 0));
+  });
+};
+
+export const snapshot = async (options?: Options) =>
+  snapshotOf(
+    await invoke<RawSnapshot>("accessibility.snapshot", [view(options)], {
+      signal: signalOf(options),
+    }),
+  );
+
+export const find = async (
+  selector: unknown,
+  options?: Options,
+): Promise<AccessibilityElement | null> => {
+  const selectors = selectorsOf(selector);
+  const {
+    timeoutMs,
+    poll = false,
+    pollTimeoutMs,
+    depth,
+  } = optionsOf(options, ["timeoutMs", "poll", "pollTimeoutMs", "depth"]);
+  const timeout = limitOf(timeoutMs, "timeoutMs");
+  if (typeof poll !== "boolean") {
+    throw new TypeError("poll must be a boolean");
+  }
+  if (pollTimeoutMs !== undefined && !poll) {
+    throw new TypeError("pollTimeoutMs applies with poll");
+  }
+  const pollLimit =
+    pollTimeoutMs === undefined
+      ? Infinity
+      : limitOf(pollTimeoutMs, "pollTimeoutMs");
+  return locate(selectors, {
+    mode: "best",
+    timeout,
+    pollLimit: poll ? pollLimit : -Infinity,
+    signal: signalOf(options),
+    depth: depthOf(depth),
+  });
+};
+
 export const setText = (element: unknown, text: unknown, options?: Options) => {
-  const ref = elementOf(element, "accessibility.setText");
+  const target = elementOf(element, "accessibility.setText");
   if (typeof text !== "string") {
     throw new TypeError("the text must be a string");
   }
   const { timeoutMs } = optionsOf(options, ["timeoutMs"]);
   const limit = limitOf(timeoutMs, "timeoutMs");
-  return act(
-    "accessibility.setText",
-    [ref, text, limit === Infinity ? null : limit],
-    options,
+  return on(target, "accessibility.setText", limit, options, (ref, left) =>
+    act(
+      "accessibility.setText",
+      [ref, text, left === Infinity ? null : left],
+      options,
+    ),
   );
 };
 
 export const tap = (element: unknown, options?: Options) => {
-  const ref = elementOf(element, "accessibility.tap");
+  const target = elementOf(element, "accessibility.tap");
   const { timeoutMs } = optionsOf(options, ["timeoutMs"]);
   const limit = limitOf(timeoutMs, "timeoutMs");
-  return act(
-    "accessibility.tap",
-    [ref, limit === Infinity ? null : limit],
-    options,
+  return on(target, "accessibility.tap", limit, options, (ref, left) =>
+    act("accessibility.tap", [ref, left === Infinity ? null : left], options),
   );
 };
 
@@ -194,9 +254,12 @@ export const perform = (
   action: unknown,
   options?: Options,
 ) => {
-  const ref = elementOf(element, "accessibility.perform");
+  const target = elementOf(element, "accessibility.perform");
   if (typeof action !== "string") {
     throw new TypeError("the action must be a string");
   }
-  return act("accessibility.perform", [ref, action], check(options, []));
+  const checked = check(options, []);
+  return on(target, "accessibility.perform", 0, checked, (ref) =>
+    act("accessibility.perform", [ref, action], checked),
+  );
 };

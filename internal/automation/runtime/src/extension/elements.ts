@@ -301,7 +301,7 @@ const search = (
   home: AccessibilitySnapshot,
   scope: string,
   selector: Selector,
-  mode: "one" | "all",
+  mode: "one" | "all" | "best" | "unique",
 ): AccessibilityElement[] => {
   const encoded = encode(selector);
   let thrown: { error: unknown } | undefined;
@@ -327,3 +327,11 @@ const search = (
   }
   return (answer.elements ?? []).map((raw) => adopt(home, raw));
 };
+
+// pick finds the match an action most likely means: "best" answers the first
+// of those the ranking cannot tell apart, and "unique" throws listing them.
+export const pick = (
+  home: AccessibilitySnapshot,
+  selector: Selector,
+  mode: "best" | "unique",
+): AccessibilityElement | null => search(home, "", selector, mode)[0] ?? null;
