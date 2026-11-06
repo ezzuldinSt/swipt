@@ -53,9 +53,10 @@ const (
 // idevice grants a 1 MiB window and 100 concurrent streams;
 // pymobiledevice3 grants a 16 MiB window (idevice 3854a5d,
 // idevice/src/xpc/mod.rs:51-60; pymobiledevice3 9c33842,
-// pymobiledevice3/remote/remotexpc.py:49-52).
+// pymobiledevice3/remote/remotexpc.py:49-52). A window smaller than a
+// screenshot's PNG makes the service wait a round trip for each grant.
 const (
-	receiveWindow        = 1 << 20
+	receiveWindow        = 16 << 20
 	maxConcurrentStreams = 100
 )
 
