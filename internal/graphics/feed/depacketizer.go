@@ -41,6 +41,11 @@ type AccessUnit struct {
 	Profile uint16
 	// Damaged is set when a packet of the unit, or one before it, was lost or malformed.
 	Damaged bool
+	// Info is what the feed read of the unit's parameter sets and slices, before its listeners
+	// see it.
+	Info UnitInfo
+
+	totals unitTotals
 }
 
 // IsKeyframe tells whether the unit holds an IRAP picture (types 16 to 23).

@@ -84,6 +84,11 @@ type Stats struct {
 	// out of the decoder; Converting is the RGBA conversion of a frame a lease answers, and
 	// Answering the time from the first packet to that frame's RGBA.
 	Decoding, Converting, Answering Timing
+	// Units and UnitBytes count the access units and their bytes; CodedUnits,
+	// SkippedUnits and UnreadUnits count them by UnitInfo.Skip; LastUnit is the newest.
+	Units, UnitBytes                      int64
+	CodedUnits, SkippedUnits, UnreadUnits int64
+	LastUnit                              UnitInfo
 }
 
 // Screen is an open stream of the device's screen, a *device.ScreenFeed.
@@ -129,6 +134,12 @@ type Feed struct {
 	prewarming                                    atomic.Bool
 	clock                                         feedClock
 	decoding, converting, answering               timing
+	// The running unit counts, which the decoding goroutine adds to, and the counts at the
+	// last decoded frame, under access.
+	units, unitBytes, changedAt atomic.Int64
+	coded, skipped, unread      atomic.Int64
+	lastUnit                    atomic.Pointer[UnitInfo]
+	framedTotals                unitTotals
 	// observeDecoded, when set before the first Acquire, sees the arrival of every decoded
 	// frame and when it was decoded, in milliseconds since the epoch.
 	observeDecoded func(arrival, decoded float64)
@@ -229,6 +240,11 @@ func (f *Feed) Stats() Stats {
 		stats.Color = *name
 	}
 	stats.Decoding, stats.Converting, stats.Answering = f.decoding.read(), f.converting.read(), f.answering.read()
+	stats.Units, stats.UnitBytes = f.units.Load(), f.unitBytes.Load()
+	stats.CodedUnits, stats.SkippedUnits, stats.UnreadUnits = f.coded.Load(), f.skipped.Load(), f.unread.Load()
+	if last := f.lastUnit.Load(); last != nil {
+		stats.LastUnit = *last
+	}
 	return stats
 }
 
@@ -412,6 +428,9 @@ func (f *Feed) decoded(s *session, picture *picture, unit *AccessUnit) {
 		return
 	}
 	made := &frame{picture: picture, time: unit.Arrival, received: unit.Received, decoded: decodedAt, turns: unit.Turns(), geometry: f.geometry, feed: f}
+	made.totals = unit.totals
+	made.info = FrameInfo{Unit: unit.Info, SincePrevious: unit.totals.since(f.framedTotals), Arrival: unit.Arrival, Decoded: f.clock.wall(decodedAt)}
+	f.framedTotals = unit.totals
 	made.refs.Store(int32(1 + len(f.frameListeners)))
 	f.replaceLatestLocked(made)
 	f.sequence++
@@ -423,7 +442,7 @@ func (f *Feed) decoded(s *session, picture *picture, unit *AccessUnit) {
 	f.access.Unlock()
 	f.frames.Add(1)
 	if f.observeDecoded != nil {
-		f.observeDecoded(unit.Arrival, f.clock.wall(decodedAt))
+		f.observeDecoded(unit.Arrival, made.info.Decoded)
 	}
 	for _, listener := range listeners {
 		listener(&Frame{frame: made})
@@ -485,6 +504,12 @@ type Lease struct {
 	access   sync.Mutex
 	sequence int64
 	released bool
+	// What the lease knows of the frame it answered last, and the units since the one it
+	// answered before; it keeps no pixels.
+	hasAnswered    bool
+	answered       FrameInfo
+	answeredTotals unitTotals
+	since          Changes
 }
 
 var _ raster.Feed = (*Lease)(nil)
@@ -526,8 +551,23 @@ func (l *Lease) answer(ctx context.Context, answered *frame, sequence int64) (*r
 	defer answered.release()
 	l.access.Lock()
 	l.sequence = max(l.sequence, sequence)
+	if l.hasAnswered {
+		l.since = answered.totals.since(l.answeredTotals)
+	} else {
+		l.since = answered.info.SincePrevious
+	}
+	l.hasAnswered, l.answered, l.answeredTotals = true, answered.info, answered.totals
 	l.access.Unlock()
 	return answered.image(ctx)
+}
+
+// Answered is what the feed knows of the frame the lease answered last, and the units since
+// the frame it answered before (since the frame decoded before it, for the lease's first);
+// false before the lease answered a frame.
+func (l *Lease) Answered() (FrameInfo, Changes, bool) {
+	l.access.Lock()
+	defer l.access.Unlock()
+	return l.answered, l.since, l.hasAnswered
 }
 
 // Latest answers the newest frame, waiting up to 5 seconds for the first one
@@ -584,6 +624,8 @@ type frame struct {
 	turns             int
 	geometry          Geometry
 	refs              atomic.Int32
+	info              FrameInfo
+	totals            unitTotals
 
 	access  sync.Mutex
 	picture *picture
@@ -605,6 +647,12 @@ func (fr *Frame) Time() float64 {
 // Turns is the quarter turns clockwise that make the frame upright.
 func (fr *Frame) Turns() int {
 	return fr.frame.turns
+}
+
+// Info is what the feed knows of the frame: its unit, the units since the frame before it,
+// and when it arrived and was decoded.
+func (fr *Frame) Info() FrameInfo {
+	return fr.frame.info
 }
 
 // Release gives the frame back; it may be called more than once.
@@ -772,6 +820,8 @@ func (s *session) run(opened screen) {
 	}
 	var listeners []func(*AccessUnit)
 	defer decoder.close()
+	inspector := newUnitInspector()
+	first := true
 	var depacketizer Depacketizer
 	var units []*AccessUnit
 	var named codec
@@ -794,6 +844,8 @@ func (s *session) run(opened screen) {
 				if unit.Damaged {
 					f.damaged.Add(1)
 				}
+				f.count(inspector, unit, first)
+				first = false
 				for _, listener := range listeners {
 					listener(unit)
 				}
