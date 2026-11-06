@@ -22,22 +22,7 @@ import (
 	"unsafe"
 
 	"github.com/sagernet/sing/common"
-	E "github.com/sagernet/sing/common/exceptions"
 )
-
-var ErrTerminated = E.New("jsc: the script was terminated")
-
-type Exception struct {
-	Message string
-}
-
-func (e *Exception) Error() string {
-	return e.Message
-}
-
-type Function func(arguments []Value) (any, error)
-
-type Bytes []byte
 
 // JavaScriptCore's collector copies the stack of every thread that ever took
 // its lock, from the thread's stack pointer to the origin of the thread's
