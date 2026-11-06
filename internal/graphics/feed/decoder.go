@@ -19,6 +19,8 @@ type codec interface {
 type codecOptions struct {
 	// software keeps the decoding on the CPU, without hardware transforms or Direct3D.
 	software bool
+	// h264 decodes H.264 rather than HEVC.
+	h264 bool
 }
 
 type codecFactory func(sets *parameterSets, options codecOptions) (codec, error)

@@ -55,6 +55,7 @@ var (
 	categoryVideoDecoder = guid(0xd6c02d4b, 0x6833, 0x45b4, 0x97, 0x1a, 0x05, 0xa4, 0xb0, 0x4b, 0xab, 0x91)
 	mediaTypeVideo       = guid(0x73646976, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71)
 	subtypeHEVC          = mediaSubtype("HEVC")
+	subtypeH264          = mediaSubtype("H264")
 	subtypeNV12          = mediaSubtype("NV12")
 	subtypeAYUV          = mediaSubtype("AYUV")
 
@@ -89,6 +90,7 @@ const (
 	enumSortAndFilter = 0x40
 
 	messageFlush            = 0x0
+	messageDrain            = 0x1
 	messageSetD3DManager    = 0x2
 	messageBeginStreaming   = 0x10000000
 	messageEndStreaming     = 0x10000001
@@ -215,10 +217,10 @@ type decoderCandidate struct {
 	hardware bool
 }
 
-// enumerateDecoders lists the HEVC decoders, hardware ones first in the order Media
+// enumerateDecoders lists the decoders of a subtype, hardware ones first in the order Media
 // Foundation ranks them, then the synchronous software ones.
-func enumerateDecoders() ([]decoderCandidate, error) {
-	input := registerTypeInfo{major: mediaTypeVideo, subtype: subtypeHEVC}
+func enumerateDecoders(subtype windows.GUID) ([]decoderCandidate, error) {
+	input := registerTypeInfo{major: mediaTypeVideo, subtype: subtype}
 	var candidates []decoderCandidate
 	var failure error
 	for _, pass := range []struct {
@@ -296,7 +298,7 @@ func available() error {
 				return
 			}
 			defer stop()
-			candidates, err := enumerateDecoders()
+			candidates, err := enumerateDecoders(subtypeHEVC)
 			for _, candidate := range candidates {
 				candidate.activate.release()
 			}
@@ -324,6 +326,10 @@ type mfCodec struct {
 	gpu       bool
 	width     int
 	height    int
+	subtype   windows.GUID
+	// skip, when set, drops the pictures of the sample times it answers true for without
+	// copying them out of the decoder.
+	skip func(time int64) bool
 
 	layout          pixelLayout
 	providesSamples bool
@@ -344,13 +350,20 @@ func newCodec(sets *parameterSets, options codecOptions) (codec, error) {
 	if err != nil {
 		return nil, err
 	}
-	candidates, err := enumerateDecoders()
+	subtype, kind := subtypeHEVC, "HEVC"
+	if options.h264 {
+		subtype, kind = subtypeH264, "H.264"
+	}
+	candidates, err := enumerateDecoders(subtype)
 	if err != nil {
 		stop()
 		return nil, err
 	}
 	if len(candidates) == 0 {
 		stop()
+		if options.h264 {
+			return nil, E.New("Media Foundation lists no H.264 decoder")
+		}
 		return nil, E.New("Media Foundation lists no HEVC decoder; install Microsoft's HEVC Video Extensions")
 	}
 	var chosen *mfCodec
@@ -360,7 +373,7 @@ func newCodec(sets *parameterSets, options codecOptions) (codec, error) {
 			candidate.activate.release()
 			continue
 		}
-		c := &mfCodec{activate: candidate.activate, name: candidate.name, width: sets.width, height: sets.height}
+		c := &mfCodec{activate: candidate.activate, name: candidate.name, width: sets.width, height: sets.height, subtype: subtype}
 		if err := c.open(options); err != nil {
 			failures = append(failures, E.Cause(err, candidate.name))
 			c.release()
@@ -370,7 +383,7 @@ func newCodec(sets *parameterSets, options codecOptions) (codec, error) {
 	}
 	if chosen == nil {
 		stop()
-		return nil, E.Cause(E.Errors(failures...), "no HEVC decoder accepted the stream")
+		return nil, E.Cause(E.Errors(failures...), "no ", kind, " decoder accepted the stream")
 	}
 	chosen.stop = stop
 	return chosen, nil
@@ -457,7 +470,7 @@ func (c *mfCodec) setInputType() error {
 	}
 	defer mediaType.release()
 	mediaType.call(attributesSetGUID, uintptr(unsafe.Pointer(&attributeMajorType)), uintptr(unsafe.Pointer(&mediaTypeVideo)))
-	mediaType.call(attributesSetGUID, uintptr(unsafe.Pointer(&attributeSubtype)), uintptr(unsafe.Pointer(&subtypeHEVC)))
+	mediaType.call(attributesSetGUID, uintptr(unsafe.Pointer(&attributeSubtype)), uintptr(unsafe.Pointer(&c.subtype)))
 	mediaType.call(attributesSetUINT64, uintptr(unsafe.Pointer(&attributeFrameSize)), uintptr(uint64(c.width)<<32|uint64(c.height)))
 	mediaType.call(attributesSetUINT32, uintptr(unsafe.Pointer(&attributeInterlaceMode)), interlaceProgressive)
 	return check("set the decoder's input type", c.transform.call(transformSetInputType, 0, uintptr(unsafe.Pointer(mediaType)), 0))
@@ -655,14 +668,22 @@ func (c *mfCodec) drain(pictures []*picture) ([]*picture, error) {
 			return pictures, check("ProcessOutput", hr)
 		}
 		if buffer.sample != nil {
-			picture, err := c.copyPicture(buffer.sample)
+			var time int64
+			buffer.sample.call(sampleGetSampleTime, uintptr(unsafe.Pointer(&time)))
+			var picture *picture
+			var err error
+			if c.skip == nil || !c.skip(time) {
+				picture, err = c.copyPicture(buffer.sample)
+			}
 			if owned {
 				buffer.sample.release()
 			}
 			if err != nil {
 				return pictures, err
 			}
-			pictures = append(pictures, picture)
+			if picture != nil {
+				pictures = append(pictures, picture)
+			}
 		}
 		if buffer.status&outputFormatChange != 0 {
 			if err := c.readOutput(); err != nil {
@@ -765,6 +786,25 @@ func (c *mfCodec) copyPicture(sample *comObject) (*picture, error) {
 		copy(out.chroma[y*width:(y+1)*width], chroma[y*int(pitch):])
 	}
 	return out, nil
+}
+
+// setSkip makes the decoder drop the pictures of the times skip answers true for.
+func (c *mfCodec) setSkip(skip func(time int64) bool) {
+	c.skip = skip
+}
+
+// Drain makes the decoder give out every picture it holds; it takes input again afterwards.
+func (c *mfCodec) Drain() ([]*picture, error) {
+	if err := check("drain the decoder", c.transform.call(transformProcessMessage, messageDrain, 0)); err != nil {
+		return nil, err
+	}
+	return c.drain(nil)
+}
+
+// Flush drops the input and pictures the decoder holds, as after a seek; the next input must
+// be a keyframe.
+func (c *mfCodec) Flush() error {
+	return check("flush the decoder", c.transform.call(transformProcessMessage, messageFlush, 0))
 }
 
 // Close flushes the decoder and releases every COM object it holds, then stops Media
