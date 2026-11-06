@@ -2,6 +2,7 @@ import { find, perform, setText, snapshot, tap } from "./accessibility";
 import * as deviceModule from "./device";
 import { decode, handleOf, RasterImage } from "./image";
 import * as inputModule from "./input";
+import { locate } from "./locate";
 import {
   find as findOnScreen,
   frames,
@@ -25,6 +26,7 @@ export const device = Object.freeze({ ...deviceModule });
 export const screen = Object.freeze({
   screenshot,
   find: findOnScreen,
+  locate,
   frames,
   waitFor,
   waitForChange,
