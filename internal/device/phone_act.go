@@ -60,6 +60,7 @@ type axSession struct {
 	reread    SnapshotOptions
 	fixed     bool
 	blocker   *blocker
+	retry     *Point
 }
 
 func (s *axSession) tap(ctx context.Context, at Point, count int, hold time.Duration) error {
