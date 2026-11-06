@@ -334,9 +334,12 @@ func (s *axSession) empty(ctx context.Context, target *PhoneNode) (bool, error) 
 	return !deletable, nil
 }
 
+// An action whose input touches the screen gets its geometry; a key or button
+// press goes without.
 type action struct {
 	name     string
 	unlocked bool
+	touches  bool
 	input    func(ctx context.Context, c *conn, geometry phoneGeometry) error
 	check    func(ctx context.Context, c *conn) error
 }
@@ -349,7 +352,7 @@ func (p *Phone) act(ctx context.Context, do action) error {
 	}
 	defer done()
 	connected := time.Now()
-	geometry, err := p.prepare(ctx, c, do.unlocked)
+	geometry, err := p.prepare(ctx, c, do.unlocked, do.touches)
 	if err != nil {
 		return err
 	}
@@ -383,18 +386,23 @@ func (p *Phone) gesture(ctx context.Context, c *conn, send func(input *hid.Clien
 	return err
 }
 
-// prepare reads what input needs first: the geometry and, for input that needs
-// an unlocked screen, the lock and backlight state. Each comes from its cache
-// while that is current. The lock state is read alongside the others, and a
-// geometry read brings the backlight state with it.
-func (p *Phone) prepare(ctx context.Context, c *conn, unlocked bool) (phoneGeometry, error) {
+// prepare reads what input needs first: the geometry for input that touches
+// the screen, and the lock and backlight state for input that needs it
+// unlocked. Each comes from its cache while that is current. The lock state is
+// read alongside the others, and a geometry read brings the backlight state
+// with it.
+func (p *Phone) prepare(ctx context.Context, c *conn, unlocked, touches bool) (phoneGeometry, error) {
 	var locked bool
 	var lockErr error
 	var lockRead sync.WaitGroup
 	if unlocked {
 		lockRead.Go(func() { locked, lockErr = c.lockState.recent(ctx) })
 	}
-	geometry, err := c.readGeometry(ctx)
+	var geometry phoneGeometry
+	var err error
+	if touches {
+		geometry, err = c.readGeometry(ctx)
+	}
 	var display string
 	var displayErr error
 	if unlocked {
@@ -415,7 +423,7 @@ func (p *Phone) prepare(ctx context.Context, c *conn, unlocked bool) (phoneGeome
 }
 
 func (p *Phone) TapPoint(ctx context.Context, at Point, count int) error {
-	return p.act(ctx, action{name: "tap " + pointText(at), unlocked: true, input: func(ctx context.Context, c *conn, geometry phoneGeometry) error {
+	return p.act(ctx, action{name: "tap " + pointText(at), unlocked: true, touches: true, input: func(ctx context.Context, c *conn, geometry phoneGeometry) error {
 		if err := geometry.check(at); err != nil {
 			return err
 		}
@@ -426,7 +434,7 @@ func (p *Phone) TapPoint(ctx context.Context, at Point, count int) error {
 }
 
 func (p *Phone) Touch(ctx context.Context, fingers [][]TouchSample) error {
-	return p.act(ctx, action{name: "touch", unlocked: true, input: func(ctx context.Context, c *conn, geometry phoneGeometry) error {
+	return p.act(ctx, action{name: "touch", unlocked: true, touches: true, input: func(ctx context.Context, c *conn, geometry phoneGeometry) error {
 		if err := checkFingers(geometry, fingers); err != nil {
 			return err
 		}
@@ -437,7 +445,7 @@ func (p *Phone) Touch(ctx context.Context, fingers [][]TouchSample) error {
 }
 
 func (p *Phone) Pinch(ctx context.Context, center Point, scale float64, duration time.Duration) error {
-	return p.act(ctx, action{name: "pinch", unlocked: true, input: func(ctx context.Context, c *conn, geometry phoneGeometry) error {
+	return p.act(ctx, action{name: "pinch", unlocked: true, touches: true, input: func(ctx context.Context, c *conn, geometry phoneGeometry) error {
 		fingers, err := pinchPath(geometry, center, scale, duration)
 		if err != nil {
 			return err
