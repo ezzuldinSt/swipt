@@ -8,20 +8,24 @@ import (
 	"errors"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/swipt-automation/swipt/internal/automation"
+	"github.com/swipt-automation/swipt/internal/graphics/feed"
 	"github.com/swipt-automation/swipt/internal/graphics/raster"
 	"github.com/swipt-automation/swipt/internal/graphics/recognize"
 	"github.com/swipt-automation/swipt/internal/jsc"
 )
 
 // Without the Objective-C engine, the calls run on internal/graphics/raster
-// and internal/graphics/recognize, and the screen is read with screenshots.
+// and internal/graphics/recognize, and the screen is read from the live feed
+// of internal/graphics/feed, or with screenshots where it has no decoder.
 type Graphics struct {
 	options Options
+	feed    *feed.Feed
 	access  sync.Mutex
 	engines map[uint64]*engine
 }
@@ -112,7 +116,29 @@ const bridge = `(native => {
 })`
 
 func New(options Options) *Graphics {
-	return &Graphics{options: options, engines: make(map[uint64]*engine)}
+	g := &Graphics{options: options, engines: make(map[uint64]*engine)}
+	if options.Connection != nil {
+		if err := feed.Available(); err != nil {
+			options.Logger.Info("reading the screen with screenshots: ", err)
+		} else {
+			g.feed = feed.New(options.Connection, options.Logger)
+		}
+	}
+	return g
+}
+
+// lease takes the live feed for a screen call, or nothing to read the screen
+// with screenshots.
+func (g *Graphics) lease(ctx context.Context) *feed.Lease {
+	if g.feed == nil {
+		return nil
+	}
+	lease, err := g.feed.Acquire(ctx)
+	if err != nil {
+		g.options.Logger.Debug(E.Cause(err, "open the screen feed, falling back to screenshots"))
+		return nil
+	}
+	return lease
 }
 
 func (g *Graphics) Install(js *jsc.Context, native jsc.Value, id uint64) {
@@ -198,6 +224,11 @@ func (g *Graphics) Run(id uint64, callID int64, call *automation.GraphicsCall) (
 
 func (g *Graphics) execute(ctx context.Context, e *engine, it *prepared, call *automation.GraphicsCall) (any, error) {
 	env := environment{engine: e, call: call}
+	if strings.HasPrefix(it.method, "screen.") {
+		if env.lease = g.lease(ctx); env.lease != nil {
+			defer env.lease.Release()
+		}
+	}
 	switch it.method {
 	case "screen.get":
 		image, err := env.screen(ctx)
@@ -246,7 +277,10 @@ func (g *Graphics) Watch(id uint64, callID int64, call *automation.GraphicsCall,
 		return failureOf(&raster.Error{Name: raster.NameType, Message: "graphics: there is no stream " + it.method})
 	}
 	ctx := call.Context()
-	env := environment{engine: e, call: call}
+	env := environment{engine: e, call: call, lease: g.lease(ctx)}
+	if env.lease != nil {
+		defer env.lease.Release()
+	}
 	var previous int64
 	defer func() {
 		if previous != 0 {
@@ -256,9 +290,18 @@ func (g *Graphics) Watch(id uint64, callID int64, call *automation.GraphicsCall,
 	ticker := time.NewTicker(watchInterval)
 	defer ticker.Stop()
 	for {
-		image, err := env.screen(ctx)
+		var image *raster.Image
+		var err error
+		if env.lease != nil {
+			image, err = env.lease.Next(ctx, time.Now().Add(watchInterval))
+		} else {
+			image, err = env.screen(ctx)
+		}
 		if err != nil {
 			return failureOf(err)
+		}
+		if image == nil {
+			continue
 		}
 		identifier := e.keep(image)
 		if previous != 0 {
@@ -266,6 +309,9 @@ func (g *Graphics) Watch(id uint64, callID int64, call *automation.GraphicsCall,
 		}
 		previous = identifier
 		publish(json.RawMessage(strconv.FormatInt(identifier, 10)))
+		if env.lease != nil {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return failureOf(&raster.Error{Name: raster.NameAbort, Message: "the operation was aborted"})
@@ -470,6 +516,15 @@ func (e *engine) close() {
 type environment struct {
 	engine *engine
 	call   *automation.GraphicsCall
+	lease  *feed.Lease
+}
+
+// Feed makes raster.Run read the screen calls from the live feed.
+func (v environment) Feed() raster.Feed {
+	if v.lease == nil {
+		return nil
+	}
+	return v.lease
 }
 
 func (v environment) Keep(object any) int64 {
@@ -531,6 +586,9 @@ func (r recognized) BoundingBox(line, candidate, start, end int) (raster.Rect, b
 
 // screen reads the screen as an image stamped with the time it arrived.
 func (v environment) screen(ctx context.Context) (*raster.Image, error) {
+	if v.lease != nil {
+		return v.lease.Latest(ctx)
+	}
 	data, scale, err := v.call.Screenshot()
 	if err != nil {
 		return nil, err
