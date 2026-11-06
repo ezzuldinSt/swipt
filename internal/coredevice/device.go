@@ -41,6 +41,9 @@ type Device struct {
 	done      chan struct{}
 	closeOnce sync.Once
 	err       error
+
+	servicesAccess sync.Mutex
+	keptServices   map[string]*XPCService
 }
 
 func newDevice(ctx context.Context, tun *tunnel.Tunnel, session *pairing.Session, identity uuid.UUID, logger logger.ContextLogger) (*Device, error) {
@@ -138,6 +141,7 @@ func (d *Device) fail(err error) {
 		d.logger.Debug("device connection closed: ", err)
 		d.err = err
 		close(d.done)
+		d.closeServices()
 		if d.rsdConn != nil {
 			d.rsdConn.Close()
 		}
