@@ -644,6 +644,13 @@ func (c *Conn) copyFile(ctx context.Context, streamID uint32, content io.Reader,
 	return nil
 }
 
+// Err reports why the connection ended, or nil while it is open.
+func (c *Conn) Err() error {
+	c.access.Lock()
+	defer c.access.Unlock()
+	return c.err
+}
+
 func (c *Conn) Close() error {
 	c.fail(net.ErrClosed)
 	return nil
