@@ -51,6 +51,12 @@ type frameDecoder struct {
 	clock    rtpClock
 	pending  []pendingUnit
 	buffer   []byte
+
+	// hint, when set, answers the range the stream's pixel format gives; onColor hears of the
+	// conversion each new format brings.
+	hint    func() rangeHint
+	onColor func(streamColor)
+	color   streamColor
 }
 
 func newFrameDecoder(factory codecFactory, options codecOptions, logger log.ContextLogger, onFrame func(*picture, *AccessUnit)) *frameDecoder {
@@ -102,6 +108,13 @@ func (d *frameDecoder) adoptParameterSets(unit *AccessUnit) bool {
 	}
 	if d.format == nil || !d.format.equal(described) || d.codec == nil {
 		d.format = described
+		d.color = streamColor{described: described.color}
+		if d.hint != nil {
+			d.color.hint = d.hint()
+		}
+		if d.onColor != nil {
+			d.onColor(d.color)
+		}
 		if d.codec == nil || !d.codec.Accepts(described) {
 			return d.makeCodec(described)
 		}
@@ -140,6 +153,7 @@ func (d *frameDecoder) decode(unit *AccessUnit) bool {
 	d.pending = append(d.pending, pendingUnit{time: time, unit: unit})
 	pictures, err := d.codec.Decode(d.buffer, time, unit.IsKeyframe())
 	for _, picture := range pictures {
+		d.color.apply(picture)
 		d.onFrame(picture, d.unitOf(picture.time, unit))
 	}
 	if err != nil {

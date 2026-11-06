@@ -6,13 +6,19 @@ import (
 	"sync"
 )
 
-// colorMatrix is the YCbCr to RGB matrix of a stream (MFVideoTransferMatrix).
+// colorMatrix is the YCbCr to RGB matrix of a stream (MFVideoTransferMatrix, H.273
+// MatrixCoefficients).
 type colorMatrix int
 
 const (
 	matrixBT709 colorMatrix = iota
 	matrixBT601
 	matrixBT2020
+	matrixFCC
+	matrixSMPTE240
+	// matrixIdentity carries G, B and R in the Y, Cb and Cr planes (GBR).
+	matrixIdentity
+	matrixYCgCo
 )
 
 // pixelLayout is how a decoded picture keeps its samples.
@@ -36,6 +42,9 @@ type picture struct {
 	chroma        []byte
 	fullRange     bool
 	matrix        colorMatrix
+	// primaries and transfer are the H.273 code points of the stream's colors, 0 when it
+	// gives none.
+	primaries, transfer uint8
 	// time is the sample time the decoder gave the picture, in 100 ns units.
 	time int64
 
@@ -80,11 +89,24 @@ func (p *picture) recycle() {
 }
 
 // coefficients are the matrix in 16.16 fixed point with the range folded in: R = Y·y + Cr·rv,
-// G = Y·y − Cb·gu − Cr·gv, B = Y·y + Cb·bu, after removing the luma and chroma offsets.
+// G = Y·y − Cb·gu − Cr·gv, B = Y·y + Cb·bu, after removing the luma and chroma offsets. The
+// identity and YCgCo matrices do not take that form: general is set and R, G and B are the rows
+// of m times Y, Cb and Cr less their offsets.
 type coefficients struct {
 	lumaOffset     int32
 	y              int32
 	rv, gu, gv, bu int32
+
+	general bool
+	offsets [3]int32
+	m       [9]int32
+}
+
+func fixed(value float64) int32 {
+	if value < 0 {
+		return -int32(-value*65536 + 0.5)
+	}
+	return int32(value*65536 + 0.5)
 }
 
 func coefficientsOf(matrix colorMatrix, fullRange bool) coefficients {
@@ -94,6 +116,10 @@ func coefficientsOf(matrix colorMatrix, fullRange bool) coefficients {
 		kr, kb = 0.299, 0.114
 	case matrixBT2020:
 		kr, kb = 0.2627, 0.0593
+	case matrixFCC:
+		kr, kb = 0.30, 0.11
+	case matrixSMPTE240:
+		kr, kb = 0.212, 0.087
 	default:
 		kr, kb = 0.2126, 0.0722
 	}
@@ -104,8 +130,15 @@ func coefficientsOf(matrix colorMatrix, fullRange bool) coefficients {
 		lumaScale, chromaScale = 255.0/219, 255.0/224
 		offset = 16
 	}
-	fixed := func(value float64) int32 {
-		return int32(value*65536 + 0.5)
+	switch matrix {
+	case matrixIdentity:
+		// Every plane is quantized like luma (H.273 8.3).
+		s := fixed(lumaScale)
+		return coefficients{general: true, offsets: [3]int32{offset, offset, offset}, m: [9]int32{0, 0, s, s, 0, 0, 0, s, 0}}
+	case matrixYCgCo:
+		// R = Y − Cg + Co, G = Y + Cg, B = Y − Cg − Co, Cg and Co in the Cb and Cr planes.
+		y, c := fixed(lumaScale), fixed(chromaScale)
+		return coefficients{general: true, offsets: [3]int32{offset, 128, 128}, m: [9]int32{y, -c, c, y, c, 0, y, -c, -c}}
 	}
 	return coefficients{
 		lumaOffset: offset,
@@ -115,6 +148,19 @@ func coefficientsOf(matrix colorMatrix, fullRange bool) coefficients {
 		gv:         fixed(chromaScale * 2 * (1 - kr) * kr / kg),
 		bu:         fixed(chromaScale * 2 * (1 - kb)),
 	}
+}
+
+// rgb converts Y, Cb and Cr samples, or averages of them, by either form.
+func (c *coefficients) rgb(luma, cb, cr int32) (red, green, blue byte) {
+	if c.general {
+		luma, cb, cr = luma-c.offsets[0], cb-c.offsets[1], cr-c.offsets[2]
+		m := &c.m
+		return clamp(luma*m[0] + cb*m[1] + cr*m[2] + 1<<15), clamp(luma*m[3] + cb*m[4] + cr*m[5] + 1<<15), clamp(luma*m[6] + cb*m[7] + cr*m[8] + 1<<15)
+	}
+	scaled := (luma-c.lumaOffset)*c.y + 1<<15
+	cb -= 128
+	cr -= 128
+	return clamp(scaled + cr*c.rv), clamp(scaled - cb*c.gu - cr*c.gv), clamp(scaled + cb*c.bu)
 }
 
 func clamp(value int32) byte {
@@ -130,12 +176,7 @@ func clamp(value int32) byte {
 
 // put writes one opaque pixel from Y, Cb and Cr samples.
 func (c *coefficients) put(pixel []byte, luma, cb, cr int32) {
-	scaled := (luma-c.lumaOffset)*c.y + 1<<15
-	cb -= 128
-	cr -= 128
-	pixel[0] = clamp(scaled + cr*c.rv)
-	pixel[1] = clamp(scaled - cb*c.gu - cr*c.gv)
-	pixel[2] = clamp(scaled + cb*c.bu)
+	pixel[0], pixel[1], pixel[2] = c.rgb(luma, cb, cr)
 	pixel[3] = 255
 }
 
@@ -149,10 +190,18 @@ func (p *picture) sample(x, y int) (luma, cb, cr int32) {
 	return int32(p.luma[y*p.stride+x]), int32(p.chroma[pair]), int32(p.chroma[pair+1])
 }
 
-// rgba converts the top-left width by height of the picture to opaque RGBA turned clockwise by
+// rgba converts the top-left width by height of the picture to opaque sRGB turned clockwise by
 // quarter turns, as SWFrame.m crops the pixel buffer and rotates the raster. The rows are
 // shared among the processors.
 func (p *picture) rgba(width, height, turns int) *image.NRGBA {
+	out := p.converted(width, height, turns)
+	if conversion := p.conversionToSRGB(); conversion != nil {
+		conversion.ConvertNRGBA(out)
+	}
+	return out
+}
+
+func (p *picture) converted(width, height, turns int) *image.NRGBA {
 	width, height = min(width, p.width), min(height, p.height)
 	turns &= 3
 	outWidth, outHeight := width, height
@@ -177,9 +226,9 @@ func (p *picture) rgba(width, height, turns int) *image.NRGBA {
 		for y := start; y < end; y++ {
 			row := out.Pix[y*out.Stride : y*out.Stride+outWidth*4]
 			switch {
-			case turns == 0 && p.layout == layoutAYUV:
+			case turns == 0 && p.layout == layoutAYUV && !c.general:
 				convertAYUVRow(row, p.luma[y*p.stride:y*p.stride+outWidth*4], &c)
-			case turns == 0:
+			case turns == 0 && !c.general:
 				p.convertRow(row, y, &c)
 			default:
 				sx, sy := origin[0]+y*down[0], origin[1]+y*down[1]
@@ -330,9 +379,8 @@ func (p *picture) quarterGray(width, height, turns int) *image.Gray {
 				if count == 0 {
 					continue
 				}
-				luma, cb, cr := (sums[qx*3]+count/2)/count, (sums[qx*3+1]+count/2)/count-128, (sums[qx*3+2]+count/2)/count-128
-				scaled := (luma-c.lumaOffset)*c.y + 1<<15
-				row[qx] = grayOf(int32(clamp(scaled+cr*c.rv)), int32(clamp(scaled-cb*c.gu-cr*c.gv)), int32(clamp(scaled+cb*c.bu)))
+				red, green, blue := c.rgb((sums[qx*3]+count/2)/count, (sums[qx*3+1]+count/2)/count, (sums[qx*3+2]+count/2)/count)
+				row[qx] = grayOf(int32(red), int32(green), int32(blue))
 			}
 		}
 	})

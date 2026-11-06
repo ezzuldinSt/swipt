@@ -68,7 +68,10 @@ type Geometry struct {
 
 // Stats counts what the feed has done since it was made.
 type Stats struct {
-	Decoder          string
+	Decoder string
+	// Color tells how the newest stream's pictures are converted: where the range came from,
+	// and the H.273 code points of the stream's VUI.
+	Color            string
 	Frames           int64
 	Converted        int64
 	DroppedBatches   int64
@@ -115,7 +118,7 @@ type Feed struct {
 	failure   error
 
 	frames, converted, dropped, damaged, requests atomic.Int64
-	decoderName                                   atomic.Pointer[string]
+	decoderName, colorName                        atomic.Pointer[string]
 	// observeDecoded, when set before the first Acquire, sees the arrival of every decoded frame.
 	observeDecoded func(arrival float64)
 
@@ -210,6 +213,9 @@ func (f *Feed) Stats() Stats {
 	}
 	if name := f.decoderName.Load(); name != nil {
 		stats.Decoder = *name
+	}
+	if name := f.colorName.Load(); name != nil {
+		stats.Color = *name
 	}
 	return stats
 }
@@ -698,6 +704,17 @@ func (s *session) run(opened screen) {
 	decoder := newFrameDecoder(f.newCodec, f.options, f.logger, func(picture *picture, unit *AccessUnit) {
 		f.decoded(s, picture, unit)
 	})
+	if reporter, ok := opened.(PixelFormatScreen); ok {
+		decoder.hint = func() rangeHint {
+			return hintOfPixelFormat(reporter.PixelFormat())
+		}
+	}
+	decoder.onColor = func(color streamColor) {
+		name := color.String()
+		if previous := f.colorName.Swap(&name); previous == nil || *previous != name {
+			f.logger.Debug("screen colors: ", name)
+		}
+	}
 	var listeners []func(*AccessUnit)
 	defer decoder.close()
 	var depacketizer Depacketizer
