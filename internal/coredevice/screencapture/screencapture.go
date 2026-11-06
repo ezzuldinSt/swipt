@@ -23,13 +23,10 @@ const (
 // the current orientation, but answers it unturned for an unknown orientation
 // or when the turned bitmap cannot be made (DDI 27B48 dtscreencaptured
 // 0x10000fca8, 0x100010f38, 0x1000135cc, 0x100014bd0).
+//
+// Captures take turns on a kept connection.
 func Capture(ctx context.Context, device *coredevice.Device) ([]byte, error) {
-	conn, err := device.DialXPC(ctx, serviceName)
-	if err != nil {
-		return nil, E.Cause(err, "screencapture: connect")
-	}
-	defer conn.Close()
-	output, err := coredevice.InvokeFeature(ctx, conn, uuid.NewString(), feature, "", map[string]any{"requestedFormat": "png"})
+	output, err := device.Service(serviceName).Invoke(ctx, uuid.NewString(), feature, "", map[string]any{"requestedFormat": "png"})
 	if err != nil {
 		return nil, err
 	}

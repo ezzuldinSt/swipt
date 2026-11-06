@@ -2,6 +2,7 @@ package device
 
 import (
 	"context"
+	"sync"
 
 	"github.com/swipt-automation/swipt/internal/coredevice/screencapture"
 )
@@ -14,12 +15,16 @@ func (p *Phone) Capture(ctx context.Context) ([]byte, float64, error) {
 		return nil, 0, err
 	}
 	defer done()
-	geometry, err := c.readGeometry(ctx)
-	if err != nil {
-		return nil, 0, err
-	}
+	var geometry phoneGeometry
+	var geometryErr error
+	var read sync.WaitGroup
+	read.Go(func() { geometry, geometryErr = c.readGeometry(ctx) })
 	p.captureAccess.Lock()
-	defer p.captureAccess.Unlock()
 	data, err := screencapture.Capture(ctx, c.device)
+	p.captureAccess.Unlock()
+	read.Wait()
+	if geometryErr != nil {
+		return nil, 0, geometryErr
+	}
 	return data, geometry.Scale, err
 }
