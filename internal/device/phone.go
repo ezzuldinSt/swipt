@@ -566,12 +566,16 @@ func (p *Phone) Info(ctx context.Context) (PhoneInfo, error) {
 	defer done()
 	info := c.device.Info()
 	out := PhoneInfo{Name: *p.connection.name.Load(), Model: info.ProductType, OSVersion: info.OSVersion, Build: info.BuildVersion}
-	geometry, err := c.readGeometry(ctx)
-	if err != nil {
-		return PhoneInfo{}, err
+	var geometry phoneGeometry
+	var geometryErr error
+	var read sync.WaitGroup
+	read.Go(func() { geometry, geometryErr = c.readGeometry(ctx) })
+	out.Language, err = c.lockState.language(ctx, c.device)
+	read.Wait()
+	if geometryErr != nil {
+		return PhoneInfo{}, geometryErr
 	}
 	out.Screen = geometry.PhoneScreen
-	out.Language, err = c.device.Language(ctx)
 	return out, err
 }
 
