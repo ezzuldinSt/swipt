@@ -276,6 +276,9 @@ func (n *PhoneNode) coverText() string {
 	case elementType(cover.AX.Type) == typeKeyboard:
 		return "the keyboard"
 	}
+	if modal := cover.modal(); modal != nil {
+		return interruption(modal)
+	}
 	return describeNode(cover)
 }
 
