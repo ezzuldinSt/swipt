@@ -44,6 +44,7 @@ func (p *Phone) SetLocation(ctx context.Context, latitude, longitude float64) er
 		return err
 	}
 	defer done()
+	defer c.tree.act()()
 	p.locationAccess.Lock()
 	defer p.locationAccess.Unlock()
 	if err = c.setLocation(ctx, latitude, longitude); err != nil {
@@ -83,6 +84,7 @@ func (p *Phone) ClearLocation(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
+	defer c.tree.act()()
 	ctx, cancel := c.operation(ctx)
 	defer cancel()
 	c.locationAccess.Lock()

@@ -340,6 +340,7 @@ func (p *Phone) act(ctx context.Context, do action) error {
 		return err
 	}
 	defer done()
+	defer c.tree.act()()
 	connected := time.Now()
 	geometry, err := p.prepare(ctx, c, do.unlocked, do.touches)
 	if err != nil {

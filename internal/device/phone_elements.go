@@ -32,17 +32,13 @@ func (p *Phone) Find(ctx context.Context, selectors []*Selector) (*View, uint64,
 	if !scripted {
 		options.Attributes = accessibility.SnapshotAttributes(fields)
 	}
+	options.Animations = true
 	c, ctx, done, err := p.begin(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer done()
 	began := time.Now()
-	geometry, err := c.readGeometry(ctx)
-	if err != nil {
-		return nil, 0, err
-	}
-	geometryTook := time.Since(began)
 	seen := c.events.screen.Load()
 	key := "find:" + strings.Join(named, ",")
 	switch {
@@ -56,11 +52,51 @@ func (p *Phone) Find(ctx context.Context, selectors []*Selector) (*View, uint64,
 		key = "find"
 	}
 	key += ":" + strconv.FormatUint(options.PID, 10) + ":" + strconv.FormatBool(options.Modal) + ":" + strconv.FormatBool(options.Focused) + ":" + fmt.Sprint(options.Attributes)
+	model, cached, err := c.tree.read(ctx, key, func(ctx context.Context, background bool) (*PhoneModel, error) {
+		return p.loadFind(ctx, c, key, options, background)
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	if cached {
+		p.connection.trace(began, "find.cached", strconv.Itoa(len(model.nodes))+" nodes of "+model.BundleID, time.Since(began))
+	}
+	if model == nil {
+		return nil, seen, nil
+	}
+	c.nodes.add(model)
+	return NewView(model, true), seen, nil
+}
+
+func (p *Phone) loadFind(ctx context.Context, c *conn, key string, options accessibility.ApplicationOptions, background bool) (*PhoneModel, error) {
+	geometry := c.geometryAhead()
+	seen := c.events.screen.Load()
+	read := c.ax.read
+	if background {
+		read = c.ax.readLow
+	}
 	queued := time.Now()
-	value, err := c.ax.read(ctx, key, func(ctx context.Context, client *accessibility.RemoteClient) (any, error) {
+	value, err := read(ctx, key, func(ctx context.Context, client *accessibility.RemoteClient) (any, error) {
 		started := time.Now()
+		options := options
+		if options.PID == 0 {
+			options.Front = c.frontGuess()
+		}
 		screen, err := client.ReadApplication(ctx, options)
-		waits := "geometry " + geometryTook.String() + ", queued " + started.Sub(queued).String()
+		read := time.Now()
+		var waited time.Duration
+		var placed phoneGeometry
+		if err == nil && screen.Root != nil {
+			placed, err = geometry(ctx)
+			waited = time.Since(read)
+		}
+		waits := "geometry " + waited.String() + ", queued " + started.Sub(queued).String()
+		if background {
+			waits = "in the background, " + waits
+		}
+		if options.Front != nil {
+			waits += ", front guessed"
+		}
 		if err != nil {
 			p.connection.trace(started, "find.failed", waits+", "+err.Error(), time.Since(started))
 			if options.PID != 0 && E.IsMulti(err, accessibility.ErrNoAnswer, accessibility.ErrNoApplication) {
@@ -73,19 +109,14 @@ func (p *Phone) Find(ctx context.Context, selectors []*Selector) (*View, uint64,
 			c.front.observed(frontApplication{pid: screen.App.Ref.PID, bundleID: screen.BundleID, at: started, via: "find"})
 			return (*PhoneModel)(nil), nil
 		}
-		model := p.model(c, geometry, screen, started, options.PID == 0)
+		model := p.model(c, placed, screen, started, options.PID == 0)
 		p.connection.trace(started, "find.read", waits+", "+strconv.Itoa(len(model.nodes))+" nodes of "+screen.BundleID+", "+strconv.FormatUint(c.events.screen.Load()-seen, 10)+" screen changes since", time.Since(started))
 		return model, nil
 	})
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	model := value.(*PhoneModel)
-	if model == nil {
-		return nil, seen, nil
-	}
-	c.nodes.add(model)
-	return NewView(model, true), seen, nil
+	return value.(*PhoneModel), nil
 }
 
 func (p *Phone) Changed(ctx context.Context, seen uint64, timeout time.Duration) error {
@@ -136,6 +167,7 @@ func (p *Phone) Perform(ctx context.Context, ref, name string) (Aim, error) {
 		return Aim{}, err
 	}
 	defer done()
+	defer c.tree.act()()
 	geometry, err := c.readGeometry(ctx)
 	if err != nil {
 		return Aim{}, err

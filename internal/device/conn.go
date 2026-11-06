@@ -33,6 +33,7 @@ type conn struct {
 	owner      context.Context
 	events     *events
 	ax         *axWorker
+	tree       *treeCache
 	front      *foreground
 	darwin     *darwinNotifications
 	nodes      nodeIndex
@@ -49,6 +50,9 @@ type conn struct {
 	location       *instruments.Location
 
 	software *hid.Client
+
+	// lastFront is the application last read as the frontmost one.
+	lastFront atomic.Pointer[accessibility.Front]
 }
 
 func newConn(s *Connection, session context.Context, device *coredevice.Device, displayClient *display.Client, owner context.Context) *conn {
@@ -60,9 +64,11 @@ func newConn(s *Connection, session context.Context, device *coredevice.Device, 
 	c.pasteboard = pasteboard.New(ctx, device, s.logger)
 	c.lockState.owner = c
 	c.ax = newAXWorker(c)
+	c.tree = newTreeCache(c)
 	c.front = newForeground(c)
 	c.darwin = newDarwinNotifications(c)
 	go c.ax.run()
+	go c.tree.run()
 	go func() { _, _ = c.lockState.recent(ctx) }()
 	go c.watchBacklight()
 	return c
