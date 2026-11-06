@@ -13,7 +13,6 @@ import (
 )
 
 const (
-	socketPath      = "/var/run/usbmuxd"
 	protocolVersion = 1
 	messagePlist    = 8
 	progName        = "swipt"
@@ -33,8 +32,7 @@ type header struct {
 }
 
 func open(ctx context.Context, message map[string]any) (net.Conn, map[string]any, error) {
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "unix", socketPath)
+	conn, err := dial(ctx)
 	if err != nil {
 		return nil, nil, E.Cause(err, "usbmuxd: connect")
 	}

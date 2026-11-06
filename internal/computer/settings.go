@@ -1,5 +1,3 @@
-//go:build darwin && cgo
-
 package computer
 
 import (

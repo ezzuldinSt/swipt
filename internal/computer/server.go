@@ -1,10 +1,7 @@
-//go:build darwin && cgo
-
 package computer
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,15 +9,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
-	"syscall"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/swipt-automation/swipt/internal/api"
-	"github.com/swipt-automation/swipt/internal/api/discovery"
 	"github.com/swipt-automation/swipt/internal/automation"
 	"github.com/swipt-automation/swipt/internal/device"
-	"github.com/swipt-automation/swipt/internal/dnssd"
 	"github.com/swipt-automation/swipt/internal/graphics"
 	"github.com/swipt-automation/swipt/internal/log"
 )
@@ -28,7 +22,6 @@ import (
 const (
 	lockFile       = "server.lock"
 	swipletsFolder = "Swiplets"
-	diskImages     = "/Library/Developer/DeveloperDiskImages/iOS_DDI/Restore"
 	shutdownGrace  = 2 * time.Second
 )
 
@@ -47,12 +40,10 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
-	home, err := os.UserHomeDir()
+	directory, caches, err := directories()
 	if err != nil {
 		return err
 	}
-	directory := filepath.Join(home, "Library/Application Support/Swipt")
-	caches := filepath.Join(home, "Library/Caches/Swipt")
 	if err = os.MkdirAll(directory, 0o755); err != nil {
 		return err
 	}
@@ -60,7 +51,7 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
-	host := LocalHostName() + ".local"
+	host := serverHost()
 	url := func() string {
 		return "http://" + net.JoinHostPort(host, strconv.Itoa(stored.Port))
 	}
@@ -73,13 +64,13 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
-	listener, err := net.Listen("tcp", ":"+strconv.Itoa(stored.Port))
-	if errors.Is(err, syscall.EADDRINUSE) {
+	listener, err := net.Listen("tcp", listenAddress(stored.Port))
+	if addressUnavailable(err) {
 		stored.Port = randomPort()
 		if err = stored.save(directory); err != nil {
 			return err
 		}
-		listener, err = net.Listen("tcp", ":"+strconv.Itoa(stored.Port))
+		listener, err = net.Listen("tcp", listenAddress(stored.Port))
 	}
 	if err != nil {
 		return E.Cause(err, "listen on port ", stored.Port)
@@ -88,8 +79,8 @@ func Run(ctx context.Context, options Options) error {
 
 	diskImage := options.DiskImage
 	if diskImage == "" {
-		if _, err := os.Stat(diskImages); err == nil {
-			diskImage = diskImages
+		if _, err := os.Stat(diskImages(directory)); err == nil {
+			diskImage = diskImages(directory)
 		}
 	}
 	deviceLogger := options.Logs.NewLogger("device")
@@ -124,10 +115,10 @@ func Run(ctx context.Context, options Options) error {
 	var stopOnce sync.Once
 	server := api.New(api.Options{
 		Device: connection, Swiplets: swiplets, Logs: options.Logs, Logger: options.Logs.NewLogger("api"),
-		AppVersion: options.Version, AppBuild: "macOS",
+		AppVersion: options.Version, AppBuild: appBuild,
 		Shutdown: func() { stopOnce.Do(func() { close(stop) }) },
 	})
-	advertisement, err := dnssd.Advertise(ctx, Name(), discovery.ServiceType, uint16(stored.Port), nil)
+	advertisement, err := advertise(ctx, stored.Port)
 	if err != nil {
 		return err
 	}

@@ -1,5 +1,3 @@
-//go:build darwin && cgo
-
 package computer
 
 import (
@@ -89,7 +87,7 @@ func chooseDevice(ctx context.Context, given string) (pairedDevice, error) {
 		return pairedDevice{}, ErrDeviceNotListed
 	}
 	names := common.Map(devices, func(it pairedDevice) string { return it.Name + " (" + it.UDID + ")" })
-	return pairedDevice{}, E.New("more than one device is connected to this Mac: ", strings.Join(names, ", "), "; choose one with -d NAME|UDID")
+	return pairedDevice{}, E.New("more than one device is connected to ", thisComputer, ": ", strings.Join(names, ", "), "; choose one with -d NAME|UDID")
 }
 
 func label(name string) string {
@@ -126,7 +124,7 @@ func findLockdownPeer(ctx context.Context, udid string) (lockdownPeer, error) {
 	}
 	found := common.Find(preferUSB(devices), func(it usbmuxd.Device) bool { return it.UDID == udid })
 	if found.ID == 0 {
-		return lockdownPeer{}, &device.Error{Problem: device.ProblemNoTunnel, Err: E.New("the device is not connected to this Mac")}
+		return lockdownPeer{}, &device.Error{Problem: device.ProblemNoTunnel, Err: E.New("the device is not connected to ", thisComputer)}
 	}
 	data, err := usbmuxd.ReadPairRecord(ctx, udid)
 	if err != nil {
