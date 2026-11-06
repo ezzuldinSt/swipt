@@ -210,3 +210,112 @@ func (p *Phone) WatchState(ctx context.Context, name string, emit func(any)) err
 		}
 	}
 }
+
+// The backlight state is kept between actions and read again after a relayed
+// notification, a button press, or input that reaches a display that was not
+// activeOn, which wakes or brightens it. The display may dim without a
+// notification, so a state older than backlightRefresh is read again in the
+// background as it is served.
+const (
+	backlightRefresh       = time.Second
+	backlightRefreshLimit  = 5 * time.Second
+	unrelayedBacklightLife = time.Second
+)
+
+type backlightCache struct {
+	access     sync.Mutex
+	value      string
+	readAt     time.Time
+	run        uint64
+	version    uint64
+	refreshing bool
+}
+
+type backlightRead struct {
+	version, run uint64
+	at           time.Time
+}
+
+func (b *backlightCache) begin(run uint64, at time.Time) backlightRead {
+	b.access.Lock()
+	defer b.access.Unlock()
+	return backlightRead{version: b.version, run: run, at: at}
+}
+
+// store keeps a state read since begin, unless something that changes it
+// happened meanwhile or a later read is kept already.
+func (b *backlightCache) store(read backlightRead, value string) {
+	b.access.Lock()
+	defer b.access.Unlock()
+	if read.version != b.version || read.at.Before(b.readAt) {
+		return
+	}
+	b.value, b.readAt, b.run = value, read.at, read.run
+}
+
+// cached answers the kept state while it is current: read during the relay's
+// current run with no notification since, or within unrelayedBacklightLife
+// without the relay. due tells that it is old enough to read again.
+func (b *backlightCache) cached(now time.Time, run uint64, relaying bool) (value string, current, due bool) {
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.readAt.IsZero() {
+		return "", false, false
+	}
+	age := now.Sub(b.readAt)
+	if (!relaying || run != b.run) && age >= unrelayedBacklightLife {
+		return "", false, false
+	}
+	return b.value, true, age >= backlightRefresh
+}
+
+func (b *backlightCache) invalidate() {
+	b.access.Lock()
+	defer b.access.Unlock()
+	b.version++
+	b.readAt = time.Time{}
+}
+
+func (b *backlightCache) inputSent() {
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.value != "activeOn" {
+		b.version++
+		b.readAt = time.Time{}
+	}
+}
+
+func (b *backlightCache) startRefresh() bool {
+	b.access.Lock()
+	defer b.access.Unlock()
+	if b.refreshing {
+		return false
+	}
+	b.refreshing = true
+	return true
+}
+
+func (b *backlightCache) endRefresh() {
+	b.access.Lock()
+	b.refreshing = false
+	b.access.Unlock()
+}
+
+func (c *conn) watchBacklight() {
+	changed, _, cancel := c.darwin.watch()
+	defer cancel()
+	received, unsubscribe := c.events.subscribe()
+	defer unsubscribe()
+	for {
+		select {
+		case <-changed:
+			c.backlightCache.invalidate()
+		case event := <-received:
+			if event.Kind == EventInput {
+				c.backlightCache.inputSent()
+			}
+		case <-c.ctx.Done():
+			return
+		}
+	}
+}

@@ -38,6 +38,8 @@ type conn struct {
 	nodes      nodeIndex
 	lockState  lockStateReader
 
+	backlightCache backlightCache
+
 	geometryAccess sync.Mutex
 	geometry       phoneGeometry
 	geometryAt     time.Time
@@ -62,6 +64,7 @@ func newConn(s *Connection, session context.Context, device *coredevice.Device, 
 	c.darwin = newDarwinNotifications(c)
 	go c.ax.run()
 	go func() { _, _ = c.lockState.recent(ctx) }()
+	go c.watchBacklight()
 	return c
 }
 
