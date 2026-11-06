@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/swipt-automation/swipt/internal/graphics/featureprint"
 )
 
 // Image is the engine side of a RasterImage (SWImageNode.m). Its geometry is known at once;
@@ -28,6 +30,10 @@ type Image struct {
 	parent    *Image
 	operation func(input *raster) *raster
 	cached    *raster
+
+	// printed is the feature print of distance and nearest, made once (feature.go).
+	printAccess sync.Mutex
+	printed     featureprint.Print
 }
 
 func newImage(width, height int, t transform, gray bool, time, timestamp float64) *Image {

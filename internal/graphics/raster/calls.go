@@ -452,7 +452,7 @@ func callDistance(c *call) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return distanceJSON(reference.distance(other)), nil
+	return distanceJSON(reference.Distance(other)), nil
 }
 
 func callNearest(c *call) (any, error) {
@@ -474,7 +474,7 @@ func callNearest(c *call) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if distance := reference.distance(other); bestIndex < 0 || distance < bestDistance {
+		if distance := reference.Distance(other); bestIndex < 0 || distance < bestDistance {
 			bestIndex, bestDistance = index-1, distance
 		}
 	}
