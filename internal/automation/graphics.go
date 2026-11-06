@@ -147,6 +147,20 @@ func resolvePath(name string) (string, error) {
 	}
 }
 
+// graphicsPrewarmer is a Graphics that can open the screen stream before a
+// script's first screen call needs it.
+type graphicsPrewarmer interface {
+	Prewarm()
+}
+
+// prewarmGraphics starts opening the screen stream as a script starts, where
+// the graphics can, so its first screen call does not wait for it.
+func (h *Host) prewarmGraphics() {
+	if prewarmer, ok := h.options.Graphics.(graphicsPrewarmer); ok {
+		prewarmer.Prewarm()
+	}
+}
+
 func (e *engine) installGraphics(native jsc.Value) {
 	graphics := e.host.options.Graphics
 	if graphics == nil {

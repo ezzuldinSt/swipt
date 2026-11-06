@@ -18,12 +18,15 @@ import (
 	"github.com/swipt-automation/swipt/internal/log"
 )
 
+// streamLinger is how long the stream stays open after the last lease goes, so the calls of a
+// script, and the scripts an agent runs one after another, share it: opening it again takes
+// a second or more to the first frame. SWScreenFeed.m's SWScreenLinger is a second.
+const streamLinger = 30 * time.Second
+
 var (
 	// How long Latest waits for the first frame (SWScreenFirstFrameLimit).
 	firstFrameLimit = 5 * time.Second
-	// The stream stays open this long after the last lease goes, so calls in a row share it
-	// (SWScreenFeed.m SWScreenLinger).
-	lingerTime = time.Second
+	lingerTime      = streamLinger
 )
 
 const (
@@ -95,7 +98,7 @@ type Opener func(ctx context.Context, deliver func(batch []byte), end func(err e
 type opener = Opener
 
 // Feed keeps the newest frame of the device's screen while anyone holds a lease (SWScreenFeed.m).
-// The first lease opens the stream; it closes a second after the last one is released.
+// The first lease opens the stream; it closes streamLinger after the last one is released.
 // Decoding runs on its own goroutine for every frame, while the RGBA pixels are made only for
 // the frames that a lease answers.
 type Feed struct {
@@ -119,6 +122,7 @@ type Feed struct {
 
 	frames, converted, dropped, damaged, requests atomic.Int64
 	decoderName, colorName                        atomic.Pointer[string]
+	prewarming                                    atomic.Bool
 	// observeDecoded, when set before the first Acquire, sees the arrival of every decoded frame.
 	observeDecoded func(arrival float64)
 
@@ -279,6 +283,26 @@ func (f *Feed) Acquire(ctx context.Context) (*Lease, error) {
 	f.replaceLatestLocked(nil)
 	opening.start(opened)
 	return &Lease{feed: f, geometry: f.geometry}, nil
+}
+
+// Prewarm opens the stream in the background when it is closed, so the next lease finds it
+// open or opening, and starts its linger again when it is open; it does not wait. The server
+// calls it as a script starts.
+func (f *Feed) Prewarm() {
+	if !f.prewarming.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer f.prewarming.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), openLimit)
+		defer cancel()
+		lease, err := f.Acquire(ctx)
+		if err != nil {
+			f.logger.Debug(E.Cause(err, "open the screen stream ahead of a script"))
+			return
+		}
+		lease.Release()
+	}()
 }
 
 // releaseLocked gives a lease back; the last one closes the stream after the linger time
