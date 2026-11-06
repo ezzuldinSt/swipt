@@ -47,7 +47,7 @@ func init() {
 		"device.pasteboard":            deviceClipboard,
 		"device.setPasteboard":         deviceSetClipboard,
 		"device.setSimulatedLocation":  deviceSetLocation,
-		"input.tap":                    screenAction(deviceTap),
+		"input.tap":                    screenCall(deviceTap),
 		"input.swipe":                  screenAction(deviceGesture),
 		"input.drag":                   screenAction(deviceGesture),
 		"input.pinch":                  screenAction(devicePinch),
@@ -59,7 +59,9 @@ func init() {
 		"accessibility.changed":        uiChanged,
 		"accessibility.setText":        screenAction(uiSetText),
 		"accessibility.perform":        screenAction(uiPerform),
-		"accessibility.tap":            screenAction(uiTap),
+		"accessibility.tap":            screenCall(uiTap),
+		"accessibility.scrollPage":     screenCall(uiScrollPage),
+		"accessibility.hitTest":        uiHitTest,
 		"fs.stat":                      fsStat,
 		"fs.list":                      fsList,
 		"fs.read":                      fsRead,
@@ -152,12 +154,19 @@ func (o *operation) screen(ctx context.Context) (*device.Phone, error) {
 }
 
 func screenAction(act func(ctx context.Context, phone *device.Phone, call *operation) error) operationFunc {
+	return screenCall(func(ctx context.Context, phone *device.Phone, call *operation) (any, error) {
+		return nil, act(ctx, phone, call)
+	})
+}
+
+// screenCall is screenAction for an action that answers something.
+func screenCall(act func(ctx context.Context, phone *device.Phone, call *operation) (any, error)) operationFunc {
 	return func(ctx context.Context, call *operation) (any, error) {
 		phone, err := call.screen(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return nil, act(ctx, phone, call)
+		return act(ctx, phone, call)
 	}
 }
 
@@ -314,7 +323,8 @@ func (o *strict) UnmarshalJSON(data []byte) error {
 }
 
 type touchOptions struct {
-	Count *int `json:"count"`
+	Count  *int `json:"count"`
+	Verify bool `json:"verify"`
 }
 
 func (o touchOptions) values() (int, error) {
@@ -394,17 +404,17 @@ func deviceState(ctx context.Context, call *operation) (any, error) {
 	return readState(ctx, phone, name)
 }
 
-func deviceTap(ctx context.Context, phone *device.Phone, call *operation) error {
+func deviceTap(ctx context.Context, phone *device.Phone, call *operation) (any, error) {
 	var at point
 	var options touchOptions
 	if err := call.decode(1, &at, &strict{&options}); err != nil {
-		return err
+		return nil, err
 	}
 	count, err := options.values()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return phone.TapPoint(ctx, device.Point(at), count)
+	return call.tapPoint(ctx, phone, device.Point(at), count, options.Verify)
 }
 
 func deviceGesture(ctx context.Context, phone *device.Phone, call *operation) error {
@@ -654,19 +664,52 @@ func uiPerform(ctx context.Context, phone *device.Phone, call *operation) error 
 	return err
 }
 
-func uiTap(ctx context.Context, phone *device.Phone, call *operation) error {
+func uiTap(ctx context.Context, phone *device.Phone, call *operation) (any, error) {
 	var ref string
 	var timeoutMs *float64
-	if err := call.decode(1, &ref, &timeoutMs); err != nil {
-		return err
+	options := struct {
+		Verify *bool `json:"verify"`
+	}{}
+	if err := call.decode(1, &ref, &timeoutMs, &strict{&options}); err != nil {
+		return nil, err
 	}
 	timeout, err := elementTimeout(timeoutMs)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if options.Verify == nil || *options.Verify {
+		return call.tapElement(ctx, phone, ref, timeout)
 	}
 	aim, err := phone.Tap(ctx, ref, timeout)
 	call.record(aim, call.args[1:]...)
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return tapResult{Element: aim.Element, Point: pointOf(aim.Point)}, nil
+}
+
+func uiScrollPage(ctx context.Context, phone *device.Phone, call *operation) (any, error) {
+	var ref, direction string
+	if err := call.decode(2, &ref, &direction); err != nil {
+		return nil, err
+	}
+	paged, err := phone.ScrollPage(ctx, ref, direction)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"moved": paged.Moved, "container": paged.Container}, nil
+}
+
+func uiHitTest(ctx context.Context, call *operation) (any, error) {
+	var points []point
+	if err := call.decode(1, &points); err != nil {
+		return nil, err
+	}
+	phone, err := call.screen(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return phone.HitTest(ctx, common.Map(points, func(at point) device.Point { return device.Point(at) }))
 }
 
 // A missing limit waits forever.
