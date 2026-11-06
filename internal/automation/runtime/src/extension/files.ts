@@ -1,4 +1,11 @@
-import { directoryURI, fileURI, joinRelative, nameOf } from "../shared/paths";
+import {
+  absoluteOf,
+  directoryURI,
+  fileURI,
+  joinRelative,
+  nameOf,
+  slashed,
+} from "../shared/paths";
 import { invoke } from "./async";
 import { Blob } from "./blob";
 import { TextDecoder, TextEncoder } from "./encoding";
@@ -250,15 +257,18 @@ export const fileOf = (value: unknown, name: string): FileHandle => {
 };
 
 export const handleOfPath = (value: string): FileHandle => {
-  const absolute = value.startsWith("file://")
-    ? decodeURIComponent(value.slice("file://".length))
-    : value;
+  const absolute = absoluteOf(value);
   for (const root of ["data", "assets", "cache"] as const) {
-    const prefix = `${rootPath(root)}/`;
-    if (absolute.startsWith(prefix)) {
+    const prefix = `${slashed(rootPath(root))}/`;
+    const head = absolute.path.slice(0, prefix.length);
+    if (
+      absolute.folded
+        ? head.toLowerCase() === prefix.toLowerCase()
+        : head === prefix
+    ) {
       return new FileHandle(token, {
         root,
-        path: absolute.slice(prefix.length).replace(/\/+$/, ""),
+        path: absolute.path.slice(prefix.length).replace(/\/+$/, ""),
       });
     }
   }
