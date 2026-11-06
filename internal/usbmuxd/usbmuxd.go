@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"net/netip"
+	"strconv"
 
 	E "github.com/sagernet/sing/common/exceptions"
 
@@ -22,6 +24,61 @@ type Device struct {
 	ID         uint64
 	UDID       string
 	Connection string
+	// Address is a Network device's address on the local network, when
+	// usbmuxd lists one.
+	Address netip.Addr
+}
+
+// usbmuxd lists a Network device's NetworkAddress as a raw sockaddr, beside
+// its InterfaceIndex. Apple Mobile Device Service on Windows wrote a Windows
+// sockaddr_in, a little-endian family first: 02 00, the port 00 00, then
+// c0 a8 01 65 (iPhone18,2, iOS 27.0.1 24A446 on Wi-Fi). A BSD sockaddr, as on
+// macOS, starts with its length and then a one-byte family.
+const (
+	familyInet       = 2
+	familyInet6BSD   = 30
+	familyInet6Linux = 10
+	familyInet6Win   = 23
+)
+
+func parseNetworkAddress(data []byte, interfaceIndex uint64) netip.Addr {
+	if len(data) < 2 {
+		return netip.Addr{}
+	}
+	family := int(data[1])
+	if family == 0 {
+		family = int(data[0])
+	}
+	var address netip.Addr
+	switch family {
+	case familyInet:
+		if len(data) < 8 {
+			return netip.Addr{}
+		}
+		address = netip.AddrFrom4([4]byte(data[4:8]))
+	case familyInet6BSD, familyInet6Linux, familyInet6Win:
+		if len(data) < 24 {
+			return netip.Addr{}
+		}
+		address = netip.AddrFrom16([16]byte(data[8:24])).Unmap()
+		if address.Is6() && address.IsLinkLocalUnicast() {
+			zone := interfaceIndex
+			if len(data) >= 28 {
+				if scope := binary.LittleEndian.Uint32(data[24:28]); scope != 0 {
+					zone = uint64(scope)
+				}
+			}
+			if zone != 0 {
+				address = address.WithZone(strconv.FormatUint(zone, 10))
+			}
+		}
+	default:
+		return netip.Addr{}
+	}
+	if !address.IsValid() || address.IsUnspecified() || address.IsLoopback() {
+		return netip.Addr{}
+	}
+	return address
 }
 
 type header struct {
@@ -97,7 +154,12 @@ func ListDevices(ctx context.Context) ([]Device, error) {
 		if id == 0 || udid == "" {
 			continue
 		}
-		devices = append(devices, Device{ID: id, UDID: udid, Connection: connection})
+		networkAddress, _ := properties["NetworkAddress"].([]byte)
+		interfaceIndex, _ := properties["InterfaceIndex"].(uint64)
+		devices = append(devices, Device{
+			ID: id, UDID: udid, Connection: connection,
+			Address: parseNetworkAddress(networkAddress, interfaceIndex),
+		})
 	}
 	return devices, nil
 }
