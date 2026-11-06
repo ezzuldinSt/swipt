@@ -80,6 +80,10 @@ type Stats struct {
 	DroppedBatches   int64
 	DamagedUnits     int64
 	KeyFrameRequests int64
+	// Decoding is the time from a unit's first packet reaching the feed to its picture coming
+	// out of the decoder; Converting is the RGBA conversion of a frame a lease answers, and
+	// Answering the time from the first packet to that frame's RGBA.
+	Decoding, Converting, Answering Timing
 }
 
 // Screen is an open stream of the device's screen, a *device.ScreenFeed.
@@ -123,8 +127,11 @@ type Feed struct {
 	frames, converted, dropped, damaged, requests atomic.Int64
 	decoderName, colorName                        atomic.Pointer[string]
 	prewarming                                    atomic.Bool
-	// observeDecoded, when set before the first Acquire, sees the arrival of every decoded frame.
-	observeDecoded func(arrival float64)
+	clock                                         feedClock
+	decoding, converting, answering               timing
+	// observeDecoded, when set before the first Acquire, sees the arrival of every decoded
+	// frame and when it was decoded, in milliseconds since the epoch.
+	observeDecoded func(arrival, decoded float64)
 
 	nextListener   int
 	unitListeners  map[int]func(*AccessUnit)
@@ -157,7 +164,7 @@ func newFeed(open opener, factory codecFactory, contextLogger log.ContextLogger)
 		contextLogger = logger.NOP()
 	}
 	return &Feed{
-		open: open, newCodec: factory, logger: contextLogger, changed: make(chan struct{}),
+		open: open, newCodec: factory, logger: contextLogger, changed: make(chan struct{}), clock: preciseClock,
 		unitListeners: make(map[int]func(*AccessUnit)), frameListeners: make(map[int]func(*Frame)),
 	}
 }
@@ -221,6 +228,7 @@ func (f *Feed) Stats() Stats {
 	if name := f.colorName.Load(); name != nil {
 		stats.Color = *name
 	}
+	stats.Decoding, stats.Converting, stats.Answering = f.decoding.read(), f.converting.read(), f.answering.read()
 	return stats
 }
 
@@ -393,13 +401,17 @@ func (f *Feed) ended(s *session, err error) {
 
 // decoded makes a picture the newest frame (SWScreenFeed.m decoded:unit:).
 func (f *Feed) decoded(s *session, picture *picture, unit *AccessUnit) {
+	decodedAt := f.clock.ticks()
+	if unit.Received != 0 {
+		f.decoding.add(time.Duration(decodedAt - unit.Received))
+	}
 	f.access.Lock()
 	if f.session != s || f.screen == nil {
 		f.access.Unlock()
 		picture.recycle()
 		return
 	}
-	made := &frame{picture: picture, time: unit.Arrival, turns: unit.Turns(), geometry: f.geometry, feed: f}
+	made := &frame{picture: picture, time: unit.Arrival, received: unit.Received, decoded: decodedAt, turns: unit.Turns(), geometry: f.geometry, feed: f}
 	made.refs.Store(int32(1 + len(f.frameListeners)))
 	f.replaceLatestLocked(made)
 	f.sequence++
@@ -411,7 +423,7 @@ func (f *Feed) decoded(s *session, picture *picture, unit *AccessUnit) {
 	f.access.Unlock()
 	f.frames.Add(1)
 	if f.observeDecoded != nil {
-		f.observeDecoded(unit.Arrival)
+		f.observeDecoded(unit.Arrival, f.clock.wall(decodedAt))
 	}
 	for _, listener := range listeners {
 		listener(&Frame{frame: made})
@@ -564,11 +576,14 @@ func (l *Lease) Next(ctx context.Context, until time.Time) (*raster.Image, error
 // RGBA image is made once, when a lease first answers it; the picture's bytes go back to the
 // pool when no one holds the frame or the image is made.
 type frame struct {
-	feed     *Feed
-	time     float64
-	turns    int
-	geometry Geometry
-	refs     atomic.Int32
+	feed *Feed
+	time float64
+	// received and decoded are the clock's readings when the unit's first packet came and
+	// when its picture came out of the decoder.
+	received, decoded int64
+	turns             int
+	geometry          Geometry
+	refs              atomic.Int32
 
 	access  sync.Mutex
 	picture *picture
@@ -664,13 +679,20 @@ func (fr *frame) image(ctx context.Context) (*raster.Image, error) {
 	if fr.picture == nil {
 		return nil, &raster.Error{Name: raster.NameUnavailable, Message: "graphics: the frame is gone"}
 	}
+	f := fr.feed
+	started := f.clock.ticks()
 	width, height := fr.cropSize(fr.picture.width, fr.picture.height)
 	pixels := fr.picture.rgba(width, height, fr.turns)
 	fr.made = raster.FromImage(pixels, fr.geometry.Scale, fr.time)
 	recycleRGBA(pixels)
 	fr.picture.recycle()
 	fr.picture = nil
-	fr.feed.converted.Add(1)
+	f.converted.Add(1)
+	finished := f.clock.ticks()
+	f.converting.add(time.Duration(finished - started))
+	if fr.received != 0 {
+		f.answering.add(time.Duration(finished - fr.received))
+	}
 	return fr.made, nil
 }
 
@@ -678,26 +700,35 @@ func (fr *frame) image(ctx context.Context) (*raster.Image, error) {
 // decodes them (SWScreenFeed.m's serial queue).
 type session struct {
 	feed      *Feed
-	batches   chan []byte
+	batches   chan delivery
 	done      chan struct{}
 	stopOnce  sync.Once
 	finished  chan struct{}
 	endedWith error
 }
 
-func newSession(f *Feed) *session {
-	return &session{feed: f, batches: make(chan []byte, batchBacklog), done: make(chan struct{}), finished: make(chan struct{})}
+// delivery is a batch and the clock's reading when it reached the feed.
+type delivery struct {
+	batch    []byte
+	received int64
 }
 
-// deliver takes a batch from the device's reading goroutine; it never blocks it.
+func newSession(f *Feed) *session {
+	return &session{feed: f, batches: make(chan delivery, batchBacklog), done: make(chan struct{}), finished: make(chan struct{})}
+}
+
+// deliver takes a batch from the device's reading goroutine; it never blocks it. The batch is
+// stamped here, on the precise clock: the device stamps its packets with time.Now, which on
+// Windows moves in steps of the system timer.
 func (s *session) deliver(batch []byte) {
+	received := s.feed.clock.ticks()
 	select {
 	case <-s.done:
 		return
 	default:
 	}
 	select {
-	case s.batches <- bytes.Clone(batch):
+	case s.batches <- delivery{batch: bytes.Clone(batch), received: received}:
 	default:
 		s.feed.dropped.Add(1)
 	}
@@ -748,14 +779,18 @@ func (s *session) run(opened screen) {
 		select {
 		case <-s.done:
 			return
-		case batch := <-s.batches:
-			units = depacketizer.PushBatch(batch, units[:0])
+		case delivered := <-s.batches:
+			depacketizer.received = delivered.received
+			units = depacketizer.PushBatch(delivered.batch, units[:0])
 			if len(units) > 0 {
 				f.access.Lock()
 				listeners = f.unitListenersLocked()
 				f.access.Unlock()
 			}
 			for _, unit := range units {
+				if unit.Received != 0 {
+					unit.Arrival = f.clock.wall(unit.Received)
+				}
 				if unit.Damaged {
 					f.damaged.Add(1)
 				}
