@@ -146,6 +146,9 @@ type Feed struct {
 	coded, skipped, unread, repeated     atomic.Int64
 	lastUnit                             atomic.Pointer[UnitInfo]
 	framedTotals                         unitTotals
+	// bandMovedAt is the count at the last unit of each band of a tiled stream that does not
+	// repeat the band's picture before it, kept by the decoding goroutine alone.
+	bandMovedAt [maxBands]int64
 	// observeDecoded, when set before the first Acquire, sees the arrival of every decoded
 	// frame and when it was decoded, in milliseconds since the epoch.
 	observeDecoded func(arrival, decoded float64)
@@ -433,8 +436,9 @@ func (f *Feed) ended(s *session, err error) {
 	s.stop()
 }
 
-// decoded makes a picture the newest frame (SWScreenFeed.m decoded:unit:).
-func (f *Feed) decoded(s *session, picture *picture, unit *AccessUnit) {
+// decoded makes a picture the newest frame (SWScreenFeed.m decoded:unit:); bandHeight is the
+// height of a tiled stream's bands it was composed of, 0 for a whole frame.
+func (f *Feed) decoded(s *session, picture *picture, unit *AccessUnit, bandHeight int) {
 	decodedAt := f.clock.ticks()
 	if unit.Received != 0 {
 		f.decoding.add(time.Duration(decodedAt - unit.Received))
@@ -450,6 +454,9 @@ func (f *Feed) decoded(s *session, picture *picture, unit *AccessUnit) {
 	made.info = FrameInfo{
 		Unit: unit.Info, SincePrevious: unit.totals.since(f.framedTotals), Arrival: unit.Arrival, Decoded: f.clock.wall(decodedAt),
 		Media: float64(picture.time) / 1e4,
+	}
+	if bandHeight > 0 {
+		made.info.Bands, made.info.BandHeight = unit.Bands, bandHeight
 	}
 	f.framedTotals = unit.totals
 	made.refs.Store(int32(1 + len(f.frameListeners)))
@@ -534,6 +541,8 @@ type Lease struct {
 	// repeated is set when the units since the frame answered before tell that the last one
 	// repeats it.
 	repeated bool
+	// turns is the answered frame's quarter turns.
+	turns int
 }
 
 var _ raster.Feed = (*Lease)(nil)
@@ -586,7 +595,7 @@ func (l *Lease) answer(ctx context.Context, answered *frame, sequence int64) (*r
 		l.since = answered.info.SincePrevious
 		l.repeated = false
 	}
-	l.hasAnswered, l.answered, l.answeredTotals = true, answered.info, answered.totals
+	l.hasAnswered, l.answered, l.answeredTotals, l.turns = true, answered.info, answered.totals, answered.turns
 	l.access.Unlock()
 	return answered.image(), nil
 }
@@ -597,6 +606,29 @@ func (l *Lease) Repeated() bool {
 	l.access.Lock()
 	defer l.access.Unlock()
 	return l.repeated
+}
+
+// RepeatedIn tells whether the units since the frame the lease answered before the last one
+// tell that the last one repeats it in pixels, a rectangle of the upright frame: they repeat
+// it, or the frames are of a tiled stream that sent no unit for the bands under pixels
+// (raster.RegionRepeatTeller).
+func (l *Lease) RepeatedIn(pixels image.Rectangle) bool {
+	l.access.Lock()
+	defer l.access.Unlock()
+	if l.repeated {
+		return true
+	}
+	info := l.answered
+	if !l.hasAnswered || info.Bands < 2 || info.BandHeight <= 0 || l.turns != 0 || pixels.Empty() {
+		return false
+	}
+	for band := range min(info.Bands, maxBands) {
+		top := band * info.BandHeight
+		if top < pixels.Max.Y && top+info.BandHeight > pixels.Min.Y && l.since.ChangedBands&(1<<band) != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Answered is what the feed knows of the frame the lease answered last, and the units since
@@ -895,6 +927,12 @@ func (s *session) stop() {
 	<-s.finished
 }
 
+// TiledScreen is a Screen that tells how many horizontal bands the device encodes each frame
+// of its stream in, and the SSRC of the top one (device.ScreenFeed.Tiles).
+type TiledScreen interface {
+	Tiles() (count int, base uint32)
+}
+
 func (s *session) run(opened screen) {
 	defer close(s.finished)
 	// Media Foundation's objects live on this thread, which runs above the others while it
@@ -905,8 +943,30 @@ func (s *session) run(opened screen) {
 	priority, restore := raiseThreadPriority()
 	defer restore()
 	f.threadPriority.Store(&priority)
+	// A tiled stream's bands come in decoding order and make frames in the composer.
+	bands := &composer{}
+	defer bands.close()
+	var composedFrames []composed
+	publish := func() {
+		for _, made := range composedFrames {
+			f.decoded(s, made.picture, made.unit, made.bandHeight)
+		}
+		clear(composedFrames)
+		composedFrames = composedFrames[:0]
+	}
 	decoder := newFrameDecoder(f.newCodec, f.options, f.logger, func(picture *picture, unit *AccessUnit) {
-		f.decoded(s, picture, unit)
+		if unit.Bands < 2 {
+			f.decoded(s, picture, unit, 0)
+			return
+		}
+		f.access.Lock()
+		height := f.geometry.Height
+		f.access.Unlock()
+		var err error
+		if composedFrames, err = bands.add(picture, unit, height, composedFrames); err != nil {
+			f.logger.Debug(E.Cause(err, "compose the screen's bands"))
+		}
+		publish()
 	})
 	if reporter, ok := opened.(PixelFormatScreen); ok {
 		decoder.hint = func() rangeHint {
@@ -919,9 +979,17 @@ func (s *session) run(opened screen) {
 			f.logger.Debug("screen colors: ", name)
 		}
 	}
+	tiler, _ := opened.(TiledScreen)
+	var merger *bandMerger
+	// Each band keeps its own picture order, which tells whether its pictures repeat.
+	var inspectors [maxBands]*unitInspector
+	inspectors[0] = newUnitInspector()
+	open := time.NewTimer(time.Hour)
+	var armed *AccessUnit
+	open.Stop()
+	defer open.Stop()
 	var listeners []func(*AccessUnit)
 	defer decoder.close()
-	inspector := newUnitInspector()
 	first := true
 	var depacketizer Depacketizer
 	var units []*AccessUnit
@@ -932,9 +1000,36 @@ func (s *session) run(opened screen) {
 		select {
 		case <-s.done:
 			return
+		case <-open.C:
+			composedFrames = bands.finish(composedFrames)
+			publish()
 		case delivered := <-s.batches:
-			depacketizer.received = delivered.received
-			units = depacketizer.PushBatch(delivered.batch, units[:0])
+			if tiler != nil {
+				count, base := tiler.Tiles()
+				switch {
+				case count > 1 && (merger == nil || merger.count != min(count, maxBands) || merger.base != base):
+					merger = newBandMerger(count, base)
+					inspectors = [maxBands]*unitInspector{}
+					for band := range merger.count {
+						inspectors[band] = newUnitInspector()
+					}
+					bands.close()
+					f.bandMovedAt = [maxBands]int64{}
+					decoder.invalidate()
+				case count <= 1 && merger != nil:
+					merger = nil
+					inspectors = [maxBands]*unitInspector{newUnitInspector()}
+					bands.close()
+					decoder.invalidate()
+				}
+			}
+			if merger != nil {
+				merger.setReceived(delivered.received)
+				units = merger.pushBatch(delivered.batch, units[:0])
+			} else {
+				depacketizer.received = delivered.received
+				units = depacketizer.PushBatch(delivered.batch, units[:0])
+			}
 			if len(units) > 0 {
 				f.access.Lock()
 				listeners = f.unitListenersLocked()
@@ -947,7 +1042,7 @@ func (s *session) run(opened screen) {
 				if unit.Damaged {
 					f.damaged.Add(1)
 				}
-				f.count(inspector, unit, first)
+				f.count(inspectors[unit.Band], unit, first)
 				first = false
 				for _, listener := range listeners {
 					listener(unit)
@@ -969,6 +1064,12 @@ func (s *session) run(opened screen) {
 				f.decoderName.Store(&name)
 			}
 			clear(units)
+			// A frame whose last bands did not come is shown with the ones that did, bandWait
+			// after its newest band.
+			if bands.open && bands.last != armed {
+				armed = bands.last
+				open.Reset(bandWait)
+			}
 		}
 	}
 }

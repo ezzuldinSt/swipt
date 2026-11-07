@@ -70,6 +70,11 @@ type surface interface {
 	// differs answers a bit for each band of bandRows rows of the top-left width by height
 	// whose samples differ from other's, the rows from 31·bandRows on in the last bit.
 	differs(other surface, width, height, bandRows int) (uint32, error)
+	// sibling makes an empty surface of the size on the same GPU, place copies all of band
+	// into it from row y on, as much as fits, and clone copies it whole.
+	sibling(width, height int) (surface, error)
+	place(band surface, y int) error
+	clone() (surface, error)
 	bytes() int
 	release()
 }

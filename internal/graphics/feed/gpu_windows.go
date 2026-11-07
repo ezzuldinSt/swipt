@@ -547,3 +547,35 @@ func (s *gpuSurface) differs(other surface, width, height, bandRows int) (uint32
 }
 
 var errOtherSurface = E.New("graphics: the frames are on different GPUs")
+
+func (s *gpuSurface) sibling(width, height int) (surface, error) {
+	t, err := s.gpu.take(width, height)
+	if err != nil {
+		return nil, err
+	}
+	s.gpu.refs.Add(1)
+	return &gpuSurface{gpu: s.gpu, texture: t}, nil
+}
+
+func (s *gpuSurface) place(band surface, y int) error {
+	o, ok := band.(*gpuSurface)
+	if !ok || o.gpu != s.gpu {
+		return errOtherSurface
+	}
+	width, rows := min(o.texture.width, s.texture.width), min(o.texture.height, s.texture.height-y)
+	if width <= 0 || rows <= 0 || y < 0 {
+		return nil
+	}
+	region := copyBox{right: uint32(width), bottom: uint32(rows), back: 1}
+	s.gpu.context.call(contextCopySubresourceRegion, uintptr(unsafe.Pointer(s.texture.texture)), 0, 0, uintptr(y), 0,
+		uintptr(unsafe.Pointer(o.texture.texture)), 0, uintptr(unsafe.Pointer(&region)))
+	return nil
+}
+
+func (s *gpuSurface) clone() (surface, error) {
+	made, err := s.sibling(s.texture.width, s.texture.height)
+	if err != nil {
+		return nil, err
+	}
+	return made, made.place(s, 0)
+}

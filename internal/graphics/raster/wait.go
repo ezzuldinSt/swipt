@@ -247,6 +247,22 @@ func (c *call) comparison(reference *Image, ignore float64) (*Comparison, error)
 	return comparison, nil
 }
 
+// RegionRepeatTeller is a RepeatTeller that can tell it of part of the frame alone, a
+// rectangle of its pixels, as a tiled stream does of the bands that came in no unit.
+type RegionRepeatTeller interface {
+	RepeatedIn(pixels image.Rectangle) bool
+}
+
+// repeatedIn tells whether the feed knows that the frame it answered last repeats the one
+// before in the comparison's region.
+func repeatedIn(feed Feed, frame *Image, c *Comparison) bool {
+	if teller, ok := feed.(RegionRepeatTeller); ok {
+		pixels, err := frame.PixelRect(c.region)
+		return err == nil && teller.RepeatedIn(pixels)
+	}
+	return repeated(feed)
+}
+
 // repeated tells whether the feed knows that the frame it answered last repeats the one before.
 func repeated(feed Feed) bool {
 	teller, ok := feed.(RepeatTeller)
@@ -293,7 +309,7 @@ func callWaitForChange(c *call) (any, error) {
 			}
 			frame = next
 			looked++
-			if repeated(feed) {
+			if repeatedIn(feed, frame, comparison) {
 				continue
 			}
 		}
@@ -395,7 +411,7 @@ func callWaitForStable(c *call) (any, error) {
 		frame = next
 		last = frameTime(frame)
 		looked++
-		if repeated(feed) {
+		if repeatedIn(feed, frame, comparison) {
 			frames++
 			moving = 0
 			continue

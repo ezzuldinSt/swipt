@@ -66,6 +66,10 @@ type Changes struct {
 	Units, Bytes int64
 	Changed      bool
 	Repeats      bool
+	// ChangedBands, for the frames of a tiled stream, has bit b set when a unit of band b
+	// may have changed it: the device sends no unit for a band that did not change, whose
+	// pixels the frame then keeps from the one before.
+	ChangedBands uint32
 }
 
 // FrameInfo is what the feed knows of a decoded frame.
@@ -83,6 +87,10 @@ type FrameInfo struct {
 	// since the stream's first unit: arrival less media is least for the frames the network
 	// held back least.
 	Media float64
+	// Bands is how many horizontal bands of BandHeight rows the frame was composed of in a
+	// tiled stream (device.Options.ScreenTiles), 0 for a stream of whole frames; band b
+	// covers the rows from b·BandHeight.
+	Bands, BandHeight int
 }
 
 // unitTotals are a feed's running counts at an access unit: units and bytes up to and
@@ -90,11 +98,19 @@ type FrameInfo struct {
 // one that does not repeat it.
 type unitTotals struct {
 	units, bytes, changedAt, movedAt int64
+	// bands are the counts at the last unit of each band that may change the picture.
+	bands [maxBands]int64
 }
 
 // since sums the units after earlier, up to and including these.
 func (t unitTotals) since(earlier unitTotals) Changes {
-	return Changes{Units: t.units - earlier.units, Bytes: t.bytes - earlier.bytes, Changed: t.changedAt > earlier.units, Repeats: t.movedAt <= earlier.units}
+	changes := Changes{Units: t.units - earlier.units, Bytes: t.bytes - earlier.bytes, Changed: t.changedAt > earlier.units, Repeats: t.movedAt <= earlier.units}
+	for band, at := range t.bands {
+		if at > earlier.units {
+			changes.ChangedBands |= 1 << band
+		}
+	}
+	return changes
 }
 
 // count reads a unit and adds it to the feed's running counts, on the decoding goroutine; the
@@ -120,7 +136,10 @@ func (f *Feed) count(inspector *unitInspector, unit *AccessUnit, first bool) {
 	if first || !unit.Info.Repeats {
 		f.movedAt.Store(units)
 	}
-	unit.totals = unitTotals{units: units, bytes: bytes, changedAt: f.changedAt.Load(), movedAt: f.movedAt.Load()}
+	if unit.Bands > 1 && unit.Band < maxBands && (first || !unit.Info.Repeats) {
+		f.bandMovedAt[unit.Band] = units
+	}
+	unit.totals = unitTotals{units: units, bytes: bytes, changedAt: f.changedAt.Load(), movedAt: f.movedAt.Load(), bands: f.bandMovedAt}
 	info := unit.Info
 	f.lastUnit.Store(&info)
 }
