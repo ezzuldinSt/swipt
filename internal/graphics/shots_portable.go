@@ -34,8 +34,12 @@ const (
 	// frames a second (iPhone18,2, iOS 27.0.1).
 	shotProofLimit = 150 * time.Millisecond
 	// Frames this far apart, in milliseconds, leave a gap in which the screen was not watched,
-	// as when the stream closed and opened again.
-	shotGap = 250.0
+	// as when the stream closed and opened again; so do units that gave no frame, as when the
+	// decoder waited for a keyframe. A shorter pause with every unit decoded is not one: every
+	// picture the device sent was compared, and a PNG's own transfer holds the stream's packets
+	// back 150-250 ms on Wi-Fi (iPhone18,2, iOS 27.0.1 24A446), so a 250 ms limit made the PNG
+	// stale by the time it landed.
+	shotGap = 1000.0
 	// After the device declined a capture as another was still in progress (CoreDeviceError
 	// 25003), a fresh one is asked for again this often, for up to shotBusyLimit.
 	shotBusyRetry     = 100 * time.Millisecond
@@ -145,7 +149,9 @@ func (c *shotCache) frame(f shotFrame) {
 		c.idle.Reset(time.Second)
 	}
 	c.access.Lock()
-	gap := previous == nil || !c.watching || info.Arrival-c.lastArrival > shotGap
+	// The frames of a tiled stream each stand for up to one unit of every band.
+	gap := previous == nil || !c.watching || info.Arrival-c.lastArrival > shotGap ||
+		info.SincePrevious.Units > int64(max(info.Bands, 1))
 	c.access.Unlock()
 	// A tiled stream sends no unit for a band that did not change.
 	still := !gap && (info.SincePrevious.Repeats || info.Bands > 1 && info.SincePrevious.ChangedBands == 0 || f.Same(previous))
