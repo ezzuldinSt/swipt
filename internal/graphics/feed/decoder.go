@@ -21,6 +21,10 @@ type codecOptions struct {
 	software bool
 	// h264 decodes H.264 rather than HEVC.
 	h264 bool
+	// resident keeps the pictures of a decoder on the GPU in its Direct3D textures, where
+	// shaders convert only what a call reads; without a GPU, a shader compiler or an AYUV
+	// output they are copied to Go memory as before.
+	resident bool
 }
 
 type codecFactory func(sets *parameterSets, options codecOptions) (codec, error)

@@ -53,6 +53,25 @@ type picture struct {
 	time int64
 
 	buffer *[]byte
+	// surface, when set, keeps the samples on the GPU instead of luma (gpu_windows.go); the
+	// picture is AYUV and has no bytes of its own.
+	surface surface
+}
+
+// surface is a picture's samples kept in a texture on the GPU, which makes only the pixels a
+// call reads, to the bit what the CPU makes of the same samples.
+type surface interface {
+	// convert writes rect of the upright output of the top-left width by height, turned
+	// clockwise by quarter turns, as opaque RGBA into out, rect.Dx()·4 bytes a row.
+	convert(out []byte, rect image.Rectangle, width, height, turns int, c *coefficients) error
+	// gray shrinks rect of the upright picture to outWidth by outHeight by averaging blocks in
+	// Y, Cb and Cr, and writes their gray, or their colors as RGBA when colors is set, into out.
+	gray(out []byte, rect image.Rectangle, outWidth, outHeight int, c *coefficients, colors bool) error
+	// differs answers a bit for each band of bandRows rows of the top-left width by height
+	// whose samples differ from other's, the rows from 31·bandRows on in the last bit.
+	differs(other surface, width, height, bandRows int) (uint32, error)
+	bytes() int
+	release()
 }
 
 // spareBuffers is how many pictures' bytes the pool keeps for the next pictures. The feed holds
@@ -127,10 +146,36 @@ func (p *picture) recycle() {
 		giveBuffer(p.buffer)
 		p.buffer, p.luma, p.chroma = nil, nil, nil
 	}
+	if p.surface != nil {
+		p.surface.release()
+		p.surface = nil
+	}
 }
+
+// bytes is the memory the picture keeps, on the GPU for a surface.
+func (p *picture) bytes() int {
+	switch {
+	case p.surface != nil:
+		return p.surface.bytes()
+	case p.buffer != nil:
+		return cap(*p.buffer)
+	}
+	return 0
+}
+
+// sameBand is the rows of a band that differs answers for same; a change is usually found in
+// the first band that holds it on the CPU.
+const sameBand = 64
 
 // same tells whether two pictures hold the same samples.
 func (p *picture) same(other *picture) bool {
+	if p.surface != nil || other.surface != nil {
+		if p.surface == nil || other.surface == nil || p.width != other.width || p.height != other.height {
+			return false
+		}
+		mask, err := p.surface.differs(other.surface, p.width, p.height, sameBand)
+		return err == nil && mask == 0
+	}
 	if p.layout != other.layout || p.width != other.width || p.height != other.height || p.stride != other.stride ||
 		len(p.luma) != len(other.luma) || len(p.chroma) != len(other.chroma) {
 		return false
@@ -142,8 +187,8 @@ func (p *picture) same(other *picture) bool {
 	var differ atomic.Bool
 	rows := len(p.luma) / max(p.stride, 1)
 	parallel(rows, func(start, end int) {
-		for y := start; y < end && !differ.Load(); y += 64 {
-			stop := min(y+64, end)
+		for y := start; y < end && !differ.Load(); y += sameBand {
+			stop := min(y+sameBand, end)
 			if !bytes.Equal(p.luma[y*p.stride:stop*p.stride], other.luma[y*p.stride:stop*p.stride]) {
 				differ.Store(true)
 			}
@@ -261,7 +306,8 @@ func (p *picture) rgba(width, height, turns int) *image.NRGBA {
 	width, height = min(width, p.width), min(height, p.height)
 	outWidth, outHeight := p.uprightSize(width, height, turns)
 	out := newRGBA(outWidth, outHeight)
-	p.rgbaInto(out.Pix, image.Rect(0, 0, outWidth, outHeight), width, height, turns)
+	// Only the live feed keeps pictures on the GPU, and it reads them through rgbaInto.
+	_ = p.rgbaInto(out.Pix, image.Rect(0, 0, outWidth, outHeight), width, height, turns)
 	return out
 }
 
@@ -275,12 +321,22 @@ func (p *picture) uprightSize(width, height, turns int) (int, int) {
 }
 
 // rgbaInto converts rect of the upright output of the top-left width by height of the picture,
-// turned clockwise by quarter turns, into out, rect.Dx()·4 bytes a row, in sRGB.
-func (p *picture) rgbaInto(out []byte, rect image.Rectangle, width, height, turns int) {
-	p.convertInto(out, rect, min(width, p.width), min(height, p.height), turns)
+// turned clockwise by quarter turns, into out, rect.Dx()·4 bytes a row, in sRGB. A picture on
+// the GPU is converted there, and only the rect comes back.
+func (p *picture) rgbaInto(out []byte, rect image.Rectangle, width, height, turns int) error {
+	width, height = min(width, p.width), min(height, p.height)
+	if p.surface != nil {
+		c := coefficientsOf(p.matrix, p.fullRange)
+		if err := p.surface.convert(out, rect, width, height, turns&3, &c); err != nil {
+			return err
+		}
+	} else {
+		p.convertInto(out, rect, width, height, turns)
+	}
 	if conversion := p.conversionToSRGB(); conversion != nil {
 		conversion.ConvertNRGBA(&image.NRGBA{Pix: out, Stride: rect.Dx() * 4, Rect: image.Rect(0, 0, rect.Dx(), rect.Dy())})
 	}
+	return nil
 }
 
 // turning maps the output of a quarter turn back to the picture: the source pixel of (x, y) in
@@ -333,15 +389,35 @@ func (p *picture) convertInto(out []byte, rect image.Rectangle, width, height, t
 // outWidth by outHeight by averaging blocks, in sRGB gray, into out (raster.Source's Gray). An
 // upright picture is averaged in Y, Cb and Cr, which is averaging its colors as the conversion is
 // linear before it clamps; a turned one is converted first.
-func (p *picture) grayInto(out []byte, rect image.Rectangle, width, height, turns, outWidth, outHeight int) {
+func (p *picture) grayInto(out []byte, rect image.Rectangle, width, height, turns, outWidth, outHeight int) error {
 	if turns&3 != 0 {
 		pixels := make([]byte, rect.Dx()*rect.Dy()*4)
-		p.rgbaInto(pixels, rect, width, height, turns)
+		if err := p.rgbaInto(pixels, rect, width, height, turns); err != nil {
+			return err
+		}
 		raster.AveragedGray(&image.NRGBA{Pix: pixels, Stride: rect.Dx() * 4, Rect: image.Rect(0, 0, rect.Dx(), rect.Dy())}, outWidth, outHeight, out)
-		return
+		return nil
 	}
 	c := coefficientsOf(p.matrix, p.fullRange)
 	conversion := p.conversionToSRGB()
+	if p.surface != nil {
+		if conversion == nil {
+			return p.surface.gray(out, rect, outWidth, outHeight, &c, false)
+		}
+		// The averaged colors come back, to take them to sRGB a row at a time as below.
+		colors := make([]byte, outWidth*outHeight*4)
+		if err := p.surface.gray(colors, rect, outWidth, outHeight, &c, true); err != nil {
+			return err
+		}
+		for qy := range outHeight {
+			row := colors[qy*outWidth*4 : (qy+1)*outWidth*4]
+			conversion.ConvertNRGBA(&image.NRGBA{Pix: row, Stride: outWidth * 4, Rect: image.Rect(0, 0, outWidth, 1)})
+			for qx := range outWidth {
+				out[qy*outWidth+qx] = grayOf(int32(row[qx*4]), int32(row[qx*4+1]), int32(row[qx*4+2]))
+			}
+		}
+		return nil
+	}
 	rectWidth, rectHeight := rect.Dx(), rect.Dy()
 	parallel(outHeight, func(start, end int) {
 		sums := make([]int32, outWidth*3)
@@ -395,6 +471,7 @@ func (p *picture) grayInto(out []byte, rect image.Rectangle, width, height, turn
 			}
 		}
 	})
+	return nil
 }
 
 // convertAYUVRow converts an upright row of V, U, Y, A pixels into R, G, B, A ones of the same
@@ -483,10 +560,22 @@ func grayOf(red, green, blue int32) byte {
 // which scales with VTPixelTransferSession). Averaging Y, Cb and Cr first is averaging the
 // colors, as the conversion is linear before it clamps.
 func (p *picture) quarterGray(width, height, turns int) *image.Gray {
+	plane, _ := p.quarter(width, height, turns)
+	return plane
+}
+
+// quarter is quarterGray, made on the GPU for a picture kept there.
+func (p *picture) quarter(width, height, turns int) (*image.Gray, error) {
 	width, height = min(width, p.width), min(height, p.height)
 	outWidth, outHeight := max(width/4, 1), max(height/4, 1)
 	plane := image.NewGray(image.Rect(0, 0, outWidth, outHeight))
 	c := coefficientsOf(p.matrix, p.fullRange)
+	if p.surface != nil {
+		if err := p.surface.gray(plane.Pix, image.Rect(0, 0, width, height), outWidth, outHeight, &c, false); err != nil {
+			return nil, err
+		}
+		return turnedGray(plane, turns), nil
+	}
 	parallel(outHeight, func(start, end int) {
 		sums := make([]int32, outWidth*3)
 		for qy := start; qy < end; qy++ {
@@ -531,7 +620,7 @@ func (p *picture) quarterGray(width, height, turns int) *image.Gray {
 			}
 		}
 	})
-	return turnedGray(plane, turns)
+	return turnedGray(plane, turns), nil
 }
 
 // turnedGray turns a gray plane clockwise by quarter turns.
