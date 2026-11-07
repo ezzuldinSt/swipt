@@ -42,6 +42,15 @@ func pushedNotification(notification uint64, response map[string]any) Push {
 	return push
 }
 
+// A tree push holds every accessibility element of the application in front
+// with its attributes, not what changed: axauditd pushed an
+// AXPTreeDumpTypeInitialDump, then 0.2-0.5 s later an
+// AXPTreeDumpTypeAdditionalData of the same elements with more attributes and
+// their actions, each time an application in use changed: of 71 pushes, one
+// repeated the one before of its kind, the others moved frames or added and
+// removed elements. Over five minutes of that it sent no layout, screen, value
+// or focus notification, only announcements, so no push names the elements to
+// read again (iPhone18,2, iOS 27.0.1 24A446).
 func pushedTree(value any) Push {
 	data, _ := value.(map[string]any)
 	tree, _ := data["treeDump"].([]any)
