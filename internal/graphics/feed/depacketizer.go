@@ -41,6 +41,20 @@ type AccessUnit struct {
 	Profile uint16
 	// Damaged is set when a packet of the unit, or one before it, was lost or malformed.
 	Damaged bool
+	// SSRC is the RTP stream the unit came in. In a tiled stream (Depacketizer DecodingOrder)
+	// Band is its band, the SSRC less the top band's, Bands how many there are, and
+	// DecodingOrder the number its first packet carried, which counts the pictures of all
+	// bands together.
+	SSRC          uint32
+	Band, Bands   int
+	DecodingOrder uint16
+	// LastBand is set when the device marks the unit's picture as the last band of its frame:
+	// the last byte of a tiled stream's picture is a control byte with bit 7 set when more
+	// bands of the frame follow (0x80), and clear on the last band sent (0x02, after the
+	// screen's width and height; iPhone18,2, iOS 27.0.1 24A446), which may come before the
+	// bottom band when the bands below it did not change. EndKnown is set when the byte was
+	// one of those.
+	EndKnown, LastBand bool
 	// Info is what the feed read of the unit's parameter sets and slices, before its listeners
 	// see it.
 	Info UnitInfo
@@ -87,6 +101,11 @@ type Depacketizer struct {
 	lastSequence uint16
 	// received stamps the units that the next packets start.
 	received int64
+	// DecodingOrder is set for a stream whose payloads carry a 16-bit decoding order number
+	// right after the payload header of every packet, a fragment's FU header included, and
+	// only once before the first unit of an aggregation packet: the device's tiled streams do
+	// (iPhone18,2, iOS 27.0.1 24A446), as RFC 7798's DONL for one counter across the bands.
+	DecodingOrder bool
 }
 
 // Reset forgets the unit in progress and the last sequence number, as when the stream reopens.
@@ -155,20 +174,40 @@ func (d *Depacketizer) Push(packet []byte, arrival float64, done []*AccessUnit) 
 	}
 	unit := d.current
 	if unit == nil {
-		unit = &AccessUnit{RTPTimestamp: timestamp, Arrival: arrival, Received: d.received, Profile: profile}
+		unit = &AccessUnit{RTPTimestamp: timestamp, Arrival: arrival, Received: d.received, Profile: profile, SSRC: binary.BigEndian.Uint32(packet[8:])}
 	}
 	if gap {
 		unit.Damaged = true
 		d.fragment = nil
 	}
 	payload := packet[offset:end]
-	switch NALType(payload) {
-	case nalAggregation:
+	ordered := true
+	if d.DecodingOrder {
+		var number uint16
+		payload, number, ordered = withoutDecodingOrder(payload)
+		if ordered && len(unit.NALs) == 0 && d.fragment == nil {
+			unit.DecodingOrder = number
+		}
+	}
+	switch {
+	case !ordered:
+		unit.Damaged = true
+		d.fragment = nil
+	case NALType(payload) == nalAggregation:
 		addAggregated(payload, unit)
-	case nalFragment:
+	case NALType(payload) == nalFragment:
 		d.addFragment(payload, unit)
 	default:
 		unit.NALs = append(unit.NALs, payload)
+	}
+	if marker && d.DecodingOrder && ordered {
+		// VideoProcessing reads the trailer this byte ends (rfb/media server_band.go).
+		switch control := packet[end-1]; {
+		case control == 0x80:
+			unit.EndKnown, unit.LastBand = true, false
+		case control != 0 && control&^0x03 == 0:
+			unit.EndKnown, unit.LastBand = true, true
+		}
 	}
 	if marker {
 		done = append(done, unit)
@@ -219,4 +258,24 @@ func (d *Depacketizer) addFragment(payload []byte, unit *AccessUnit) {
 		unit.NALs = append(unit.NALs, d.fragment)
 		d.fragment = nil
 	}
+}
+
+// withoutDecodingOrder drops the decoding order number of a payload (Depacketizer
+// DecodingOrder) in place, moving the headers before it up, and answers it; false when the
+// payload is too short.
+func withoutDecodingOrder(payload []byte) ([]byte, uint16, bool) {
+	if NALType(payload) == nalFragment {
+		if len(payload) < 6 {
+			return nil, 0, false
+		}
+		number := binary.BigEndian.Uint16(payload[3:])
+		payload[4], payload[3], payload[2] = payload[2], payload[1], payload[0]
+		return payload[2:], number, true
+	}
+	if len(payload) < 5 {
+		return nil, 0, false
+	}
+	number := binary.BigEndian.Uint16(payload[2:])
+	payload[3], payload[2] = payload[1], payload[0]
+	return payload[2:], number, true
 }

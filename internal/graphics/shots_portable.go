@@ -147,7 +147,8 @@ func (c *shotCache) frame(f shotFrame) {
 	c.access.Lock()
 	gap := previous == nil || !c.watching || info.Arrival-c.lastArrival > shotGap
 	c.access.Unlock()
-	still := !gap && (info.SincePrevious.Repeats || f.Same(previous))
+	// A tiled stream sends no unit for a band that did not change.
+	still := !gap && (info.SincePrevious.Repeats || info.Bands > 1 && info.SincePrevious.ChangedBands == 0 || f.Same(previous))
 	if previous != nil {
 		previous.Release()
 	}

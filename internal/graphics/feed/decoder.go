@@ -150,7 +150,8 @@ func (d *frameDecoder) decode(unit *AccessUnit) bool {
 	if len(d.buffer) == 0 {
 		return false
 	}
-	time := d.clock.time(unit.RTPTimestamp)
+	// The bands of a tiled frame share its timestamp, and their pictures need times of their own.
+	time := d.clock.time(unit.RTPTimestamp) + int64(unit.Band)
 	if len(d.pending) >= pendingLimit {
 		d.pending = append(d.pending[:0], d.pending[len(d.pending)-pendingLimit/2:]...)
 	}
