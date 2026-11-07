@@ -113,6 +113,16 @@ func (f *foreground) get(ctx context.Context) (frontApplication, error) {
 
 // known answers the pid of the app in front when get would answer it without
 // reading.
+// lastPID is the process last seen in front, however long ago, or 0.
+func (f *foreground) lastPID() uint64 {
+	if f == nil {
+		return 0
+	}
+	f.access.Lock()
+	defer f.access.Unlock()
+	return f.current.pid
+}
+
 func (f *foreground) known() (uint64, bool) {
 	f.access.Lock()
 	defer f.access.Unlock()
