@@ -330,6 +330,10 @@ type mfCodec struct {
 	// skip, when set, drops the pictures of the sample times it answers true for without
 	// copying them out of the decoder.
 	skip func(time int64) bool
+	// frames keeps the pictures on the GPU (codecOptions.resident); residentFailure tells why
+	// they are copied to Go memory instead.
+	frames          *gpu
+	residentFailure string
 
 	layout          pixelLayout
 	providesSamples bool
@@ -390,7 +394,12 @@ func newCodec(sets *parameterSets, options codecOptions) (codec, error) {
 }
 
 func (c *mfCodec) Name() string {
-	if c.gpu {
+	switch {
+	case c.frames != nil && c.layout == layoutAYUV:
+		return c.name + " (Direct3D 11, frames on the GPU)"
+	case c.gpu && c.residentFailure != "":
+		return c.name + " (Direct3D 11, frames on the CPU: " + c.residentFailure + ")"
+	case c.gpu:
 		return c.name + " (Direct3D 11)"
 	}
 	return c.name + " (software)"
@@ -426,7 +435,77 @@ func (c *mfCodec) open(options codecOptions) error {
 	if err := check("begin streaming", c.transform.call(transformProcessMessage, messageBeginStreaming, 0)); err != nil {
 		return err
 	}
-	return check("start the stream", c.transform.call(transformProcessMessage, messageStartOfStream, 0))
+	if err := check("start the stream", c.transform.call(transformProcessMessage, messageStartOfStream, 0)); err != nil {
+		return err
+	}
+	if c.gpu && options.resident {
+		// The shaders are made now, though the decoder may answer AYUV only once the stream's
+		// parameter sets change its output type.
+		if frames, err := newGPU(c.device); err != nil {
+			c.residentFailure = err.Error()
+		} else {
+			c.frames = frames
+		}
+	}
+	return nil
+}
+
+// dropResident copies the pictures to Go memory from now on.
+func (c *mfCodec) dropResident(reason string) {
+	if c.frames != nil {
+		c.frames.close()
+		c.frames = nil
+	}
+	c.residentFailure = reason
+}
+
+// takePicture keeps an output sample's picture on the GPU, or copies it to Go memory.
+func (c *mfCodec) takePicture(sample *comObject) (*picture, error) {
+	if c.frames != nil && c.layout == layoutAYUV {
+		picture, reason, err := c.residentPicture(sample)
+		if picture != nil || err != nil {
+			return picture, err
+		}
+		c.dropResident(reason)
+	}
+	return c.copyPicture(sample)
+}
+
+// residentPicture copies the visible part of a Direct3D output sample into a texture of the
+// decoder's pool, on the GPU. It answers why not when the sample is not an AYUV texture.
+func (c *mfCodec) residentPicture(sample *comObject) (*picture, string, error) {
+	var time int64
+	sample.call(sampleGetSampleTime, uintptr(unsafe.Pointer(&time)))
+	var buffer *comObject
+	if err := check("read the output buffer", sample.call(sampleGetBufferByIndex, 0, uintptr(unsafe.Pointer(&buffer)))); err != nil {
+		return nil, "", err
+	}
+	defer buffer.release()
+	resource, hr := buffer.query(&iidDXGIBuffer)
+	if hr.failed() {
+		return nil, "the output is not a Direct3D surface", nil
+	}
+	defer resource.release()
+	var texture *comObject
+	if hr = resource.call(dxgiBufferGetResource, uintptr(unsafe.Pointer(&iidTexture2D)), uintptr(unsafe.Pointer(&texture))); hr.failed() || texture == nil {
+		return nil, "the output is not a Direct3D texture", nil
+	}
+	defer texture.release()
+	var index uint32
+	resource.call(dxgiBufferGetSubresourceIndex, uintptr(unsafe.Pointer(&index)))
+	var desc textureDesc
+	texture.call(texture2DGetDesc, uintptr(unsafe.Pointer(&desc)))
+	if desc.format != formatAYUV || int(desc.width) < c.visibleWidth || int(desc.height) < c.visibleHeight {
+		return nil, "the output texture is not AYUV", nil
+	}
+	surface, err := c.frames.copyIn(texture, index, c.visibleWidth, c.visibleHeight)
+	if err != nil {
+		// Out of GPU memory, as when a script holds many frames: this one goes to Go memory.
+		picture, err := c.copyPicture(sample)
+		return picture, "", err
+	}
+	out := &picture{layout: layoutAYUV, width: c.visibleWidth, height: c.visibleHeight, stride: c.visibleWidth * 4, fullRange: c.fullRange, matrix: c.matrix, time: time, surface: surface}
+	return out, "", nil
 }
 
 // useDirect3D hands the decoder a Direct3D 11 device on the default adapter, so it decodes
@@ -676,7 +755,7 @@ func (c *mfCodec) drain(pictures []*picture) ([]*picture, error) {
 			var picture *picture
 			var err error
 			if c.skip == nil || !c.skip(time) {
-				picture, err = c.copyPicture(buffer.sample)
+				picture, err = c.takePicture(buffer.sample)
 			}
 			if owned {
 				buffer.sample.release()
@@ -837,6 +916,10 @@ func (c *mfCodec) release() {
 	}
 	c.manager.release()
 	c.manager = nil
+	if c.frames != nil {
+		c.frames.close()
+		c.frames = nil
+	}
 	c.device.release()
 	c.device = nil
 }

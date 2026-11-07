@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"image"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -154,6 +155,10 @@ type Feed struct {
 	frameListeners map[int]func(*Frame)
 }
 
+// CPUFramesVariable, set to 1, copies every decoded frame to Go memory, as before frames were
+// kept on the GPU.
+const CPUFramesVariable = "SWIPT_SCREEN_CPU_FRAMES"
+
 // New makes a feed of the connection's screen.
 func New(connection *device.Connection, logger log.ContextLogger) *Feed {
 	f := newFeed(func(ctx context.Context, deliver func([]byte), end func(error)) (screen, error) {
@@ -164,6 +169,7 @@ func New(connection *device.Connection, logger log.ContextLogger) *Feed {
 		return opened, nil
 	}, newCodec, logger)
 	f.check = available
+	f.options.resident = os.Getenv(CPUFramesVariable) != "1"
 	return f
 }
 
@@ -172,6 +178,7 @@ func New(connection *device.Connection, logger log.ContextLogger) *Feed {
 func NewWithOpener(open Opener, logger log.ContextLogger) *Feed {
 	f := newFeed(open, newCodec, logger)
 	f.check = available
+	f.options.resident = os.Getenv(CPUFramesVariable) != "1"
 	return f
 }
 
@@ -724,7 +731,11 @@ func (fr *Frame) Quarter(ctx context.Context) (*image.Gray, error) {
 		return nil, &raster.Error{Name: raster.NameUnavailable, Message: "graphics: the frame is gone"}
 	}
 	width, height := f.cropSize(f.picture.width, f.picture.height)
-	f.quarter = f.picture.quarterGray(width, height, f.turns)
+	quarter, err := f.picture.quarter(width, height, f.turns)
+	if err != nil {
+		return nil, &raster.Error{Name: raster.NameUnavailable, Message: "graphics: " + err.Error()}
+	}
+	f.quarter = quarter
 	return f.quarter, nil
 }
 
@@ -767,8 +778,8 @@ type frameSource struct {
 
 // Bytes is the picture's, which the source keeps whatever part of it an image shows.
 func (s *frameSource) Bytes() int {
-	if p := s.frame.picture; p != nil && p.buffer != nil {
-		return cap(*p.buffer)
+	if p := s.frame.picture; p != nil {
+		return p.bytes()
 	}
 	return 0
 }
@@ -804,7 +815,9 @@ func (s *frameSource) Pixels(ctx context.Context, rect image.Rectangle, out []by
 	fr := s.frame
 	f := fr.feed
 	started := f.clock.ticks()
-	p.rgbaInto(out, rect, width, height, fr.turns)
+	if err = p.rgbaInto(out, rect, width, height, fr.turns); err != nil {
+		return &raster.Error{Name: raster.NameUnavailable, Message: "graphics: " + err.Error()}
+	}
 	f.converted.Add(1)
 	finished := f.clock.ticks()
 	f.converting.add(time.Duration(finished - started))
@@ -822,7 +835,9 @@ func (s *frameSource) Gray(ctx context.Context, rect image.Rectangle, outWidth, 
 	if err != nil {
 		return err
 	}
-	p.grayInto(out, rect, width, height, s.frame.turns, outWidth, outHeight)
+	if err = p.grayInto(out, rect, width, height, s.frame.turns, outWidth, outHeight); err != nil {
+		return &raster.Error{Name: raster.NameUnavailable, Message: "graphics: " + err.Error()}
+	}
 	return nil
 }
 
@@ -911,6 +926,8 @@ func (s *session) run(opened screen) {
 	var depacketizer Depacketizer
 	var units []*AccessUnit
 	var named codec
+	var namedAt int64
+	renamed := false
 	for {
 		select {
 		case <-s.done:
@@ -940,10 +957,16 @@ func (s *session) run(opened screen) {
 					opened.RequestKeyFrame()
 				}
 				if decoder.codec != nil && decoder.codec != named {
-					named = decoder.codec
+					named, namedAt, renamed = decoder.codec, f.frames.Load(), false
 					name := named.Name()
 					f.decoderName.Store(&name)
 				}
+			}
+			// A decoder may tell where it keeps its frames only once its first ones came.
+			if named != nil && !renamed && f.frames.Load() > namedAt {
+				renamed = true
+				name := named.Name()
+				f.decoderName.Store(&name)
 			}
 			clear(units)
 		}
