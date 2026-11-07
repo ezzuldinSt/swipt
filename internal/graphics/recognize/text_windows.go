@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"image"
-	"image/color"
 	"math"
 	"slices"
 	"strconv"
@@ -15,8 +14,6 @@ import (
 	"unsafe"
 
 	E "github.com/sagernet/sing/common/exceptions"
-
-	"golang.org/x/image/draw"
 )
 
 // glyphPixels is the height SWRecognizeText samples text of minimumHeight at.
@@ -88,18 +85,24 @@ func ReadText(ctx context.Context, img Image, options TextOptions) (*Text, error
 	}
 	width, height := sampled(region.Dx(), region.Dy(), s.scale, options.MinimumHeight, int(limit)-2*maximumMargin)
 	margin := min(max(min(width, height)/4, minimumMargin), maximumMargin)
-	bitmap, err := newBitmap(img.Pixels, region, width, height, margin)
+	bitmap, err := takeBitmap(width+2*margin, height+2*margin)
 	if err != nil {
+		return nil, E.Cause(err, "graphics: make the bitmap for OCR")
+	}
+	if err := fillBitmap(bitmap, img.Pixels, region, width, height, margin); err != nil {
+		bitmap.release()
 		return nil, E.Cause(err, "graphics: copy the pixels for OCR")
 	}
-	defer bitmap.release()
 	result, err := recognize(ctx, engine, bitmap)
 	if err != nil {
+		// A reading that stopped early may still read the bitmap.
+		bitmap.release()
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		return nil, E.Cause(err, "graphics: run OcrEngine")
 	}
+	giveBitmap(bitmap, width+2*margin, height+2*margin)
 	defer result.release()
 	angle, lines, err := readResult(result)
 	if err != nil {
@@ -350,80 +353,6 @@ func subtags(tag string) (language, script string) {
 		script = parts[1]
 	}
 	return parts[0], script
-}
-
-// newBitmap copies a region of pixels, scaled to width x height inside a margin of its border's mean
-// colour, into a SoftwareBitmap of premultiplied Bgra8 through a Windows.Storage.Streams.Buffer.
-func newBitmap(pixels image.Image, region image.Rectangle, width, height, margin int) (*object, error) {
-	canvas := image.NewRGBA(image.Rect(0, 0, width+2*margin, height+2*margin))
-	inside := image.Rect(margin, margin, margin+width, margin+height)
-	source := region.Add(pixels.Bounds().Min)
-	if source.Dx() == width && source.Dy() == height {
-		draw.Draw(canvas, inside, pixels, source.Min, draw.Src)
-	} else {
-		draw.BiLinear.Scale(canvas, inside, pixels, source, draw.Src, nil)
-	}
-	var sum [4]int
-	border := 0
-	for y := inside.Min.Y; y < inside.Max.Y; y++ {
-		step := 1
-		if y != inside.Min.Y && y != inside.Max.Y-1 {
-			step = max(width-1, 1)
-		}
-		for x := inside.Min.X; x < inside.Max.X; x += step {
-			for channel, value := range canvas.Pix[canvas.PixOffset(x, y):][:4] {
-				sum[channel] += int(value)
-			}
-			border++
-		}
-	}
-	background := image.NewUniform(color.RGBA{uint8(sum[0] / border), uint8(sum[1] / border), uint8(sum[2] / border), uint8(sum[3] / border)})
-	for _, strip := range []image.Rectangle{
-		image.Rect(0, 0, canvas.Rect.Dx(), margin),
-		image.Rect(0, inside.Max.Y, canvas.Rect.Dx(), canvas.Rect.Dy()),
-		image.Rect(0, margin, margin, inside.Max.Y),
-		image.Rect(inside.Max.X, margin, canvas.Rect.Dx(), inside.Max.Y),
-	} {
-		draw.Draw(canvas, strip, background, image.Point{}, draw.Src)
-	}
-	for index := 0; index < len(canvas.Pix); index += 4 {
-		canvas.Pix[index], canvas.Pix[index+2] = canvas.Pix[index+2], canvas.Pix[index]
-	}
-	factory, err := activate("Windows.Storage.Streams.Buffer", &iidBufferFactory)
-	if err != nil {
-		return nil, err
-	}
-	defer factory.release()
-	var buffer *object
-	// IBufferFactory::Create
-	if err := factory.call(6, uintptr(len(canvas.Pix)), uintptr(unsafe.Pointer(&buffer))); err != nil {
-		return nil, err
-	}
-	defer buffer.release()
-	// IBuffer::put_Length
-	if err := buffer.call(8, uintptr(len(canvas.Pix))); err != nil {
-		return nil, err
-	}
-	access, err := buffer.query(&iidBufferByteAccess)
-	if err != nil {
-		return nil, err
-	}
-	defer access.release()
-	var data *byte
-	// IBufferByteAccess::Buffer, the only method after IUnknown's
-	if err := access.call(3, uintptr(unsafe.Pointer(&data))); err != nil {
-		return nil, err
-	}
-	copy(unsafe.Slice(data, len(canvas.Pix)), canvas.Pix)
-	statics, err := activate("Windows.Graphics.Imaging.SoftwareBitmap", &iidSoftwareBitmapStatics)
-	if err != nil {
-		return nil, err
-	}
-	defer statics.release()
-	var bitmap *object
-	// ISoftwareBitmapStatics::CreateCopyWithAlphaFromBuffer
-	err = statics.call(10, uintptr(unsafe.Pointer(buffer)), bitmapPixelFormatBgra8, uintptr(canvas.Rect.Dx()), uintptr(canvas.Rect.Dy()), bitmapAlphaModePremultiplied, uintptr(unsafe.Pointer(&bitmap)))
-	return bitmap, err
 }
 
 func recognize(ctx context.Context, engine *object, bitmap *object) (*object, error) {
