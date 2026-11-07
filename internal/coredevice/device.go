@@ -44,14 +44,19 @@ type Device struct {
 
 	servicesAccess sync.Mutex
 	keptServices   map[string]*XPCService
+
+	bulk *bulkTunnel
 }
 
-func newDevice(ctx context.Context, tun *tunnel.Tunnel, session *pairing.Session, identity uuid.UUID, logger logger.ContextLogger) (*Device, error) {
+func newDevice(ctx context.Context, tun *tunnel.Tunnel, session *pairing.Session, identity uuid.UUID, logger logger.ContextLogger, connectBulk func(ctx context.Context) (*Device, error)) (*Device, error) {
 	d := &Device{
 		tunnel:  tun,
 		session: session,
 		logger:  logger,
 		done:    make(chan struct{}),
+	}
+	if connectBulk != nil {
+		d.bulk = &bulkTunnel{owner: d, connect: connectBulk, waitFor: bulkWait, idleFor: bulkIdle, retryAfter: bulkRetry}
 	}
 	err := d.handshake(ctx, identity)
 	if err != nil {
@@ -142,13 +147,18 @@ func (d *Device) fail(err error) {
 		d.err = err
 		close(d.done)
 		d.closeServices()
+		if d.bulk != nil {
+			d.bulk.close()
+		}
 		if d.rsdConn != nil {
 			d.rsdConn.Close()
 		}
 		if d.session != nil {
 			d.session.Close()
 		}
-		d.tunnel.Close()
+		if d.tunnel != nil {
+			d.tunnel.Close()
+		}
 	})
 }
 

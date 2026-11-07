@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -20,6 +21,11 @@ import (
 
 // RelayVariable, set to 1, keeps a device on Wi-Fi behind usbmuxd's relay.
 const RelayVariable = "SWIPT_WIFI_RELAY"
+
+// SingleTunnelVariable, set to 1, keeps the display stream and screenshots in
+// the tunnel of every other request instead of a second one (see
+// coredevice.Device.Bulk).
+const SingleTunnelVariable = "SWIPT_SINGLE_TUNNEL"
 
 const (
 	// A direct connection answered lockdown and opened the tunnel in
@@ -49,6 +55,7 @@ type router struct {
 	udid   string
 	name   string
 	relay  bool
+	bulk   bool
 	logger log.ContextLogger
 	known  *knownDevices
 
@@ -71,6 +78,7 @@ func newRouter(udid, name string, relay bool, known *knownDevices, logger log.Co
 		udid:       udid,
 		name:       name,
 		relay:      relay,
+		bulk:       !relayForced(false, os.Getenv(SingleTunnelVariable)),
 		logger:     logger,
 		known:      known,
 		list:       usbmuxd.ListDevices,
@@ -179,7 +187,7 @@ func (r *router) connect(ctx context.Context) (*coredevice.Device, error) {
 		r.logger.Info(E.Errors(failures...), "; connecting through usbmuxd instead")
 	}
 	r.logger.Debug("connecting through ", found.Connection, " as usbmuxd device ", found.ID)
-	connected, err := r.open(ctx, coredevice.LockdownOptions{Record: record, Dial: r.dialRelay(found.ID), Logger: r.logger})
+	connected, err := r.open(ctx, coredevice.LockdownOptions{Record: record, Dial: r.dialRelay(found.ID), Logger: r.logger, Bulk: r.bulk})
 	if err == nil {
 		r.remember(knownDevice{UDID: r.udid, Name: r.name, Connected: r.now()})
 	}
@@ -244,7 +252,7 @@ func (r *router) connectDirect(ctx context.Context, address netip.Addr, record *
 	dial := func(ctx context.Context, port uint16) (net.Conn, error) {
 		return r.dialDirect(ctx, netip.AddrPortFrom(address, port))
 	}
-	connected, err := r.open(ctx, coredevice.LockdownOptions{Record: record, Dial: dial, Logger: r.logger})
+	connected, err := r.open(ctx, coredevice.LockdownOptions{Record: record, Dial: dial, Logger: r.logger, Bulk: r.bulk})
 	if err != nil && errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
 		err = E.Cause(err, "no answer within ", directPatience)
 	}

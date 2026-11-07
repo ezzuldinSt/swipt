@@ -24,9 +24,16 @@ const (
 // or when the turned bitmap cannot be made (DDI 27B48 dtscreencaptured
 // 0x10000fca8, 0x100010f38, 0x1000135cc, 0x100014bd0).
 //
-// Captures take turns on a kept connection.
+// Captures take turns on a kept connection, through the device's tunnel for
+// transfers (see coredevice.Device.Bulk).
 func Capture(ctx context.Context, device *coredevice.Device) ([]byte, error) {
-	output, err := device.Service(serviceName).Invoke(ctx, uuid.NewString(), feature, "", map[string]any{"requestedFormat": "png"})
+	bulk, release := device.Bulk(ctx, false)
+	defer release()
+	input := map[string]any{"requestedFormat": "png"}
+	output, err := bulk.Service(serviceName).Invoke(ctx, uuid.NewString(), feature, "", input)
+	if err != nil && bulk != device && bulk.Err() != nil && ctx.Err() == nil {
+		output, err = device.Service(serviceName).Invoke(ctx, uuid.NewString(), feature, "", input)
+	}
 	if err != nil {
 		return nil, err
 	}

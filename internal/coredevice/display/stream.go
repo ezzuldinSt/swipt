@@ -12,6 +12,7 @@ import (
 
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/swipt-automation/swipt/internal/coredevice"
 	"github.com/swipt-automation/swipt/internal/coredevice/tunnel"
 	"github.com/swipt-automation/swipt/internal/coredevice/xpc"
 )
@@ -19,7 +20,11 @@ import (
 const keyFrameInterval = time.Second
 
 type Stream struct {
-	client   *Client
+	client *Client
+	// device carries the stream: the client's device or a second tunnel to
+	// it, which release lets go of.
+	device   *coredevice.Device
+	release  func()
 	info     StreamInfo
 	conn     *tunnel.UDPConn
 	control  *xpc.Conn
@@ -44,9 +49,11 @@ type Stream struct {
 	localOnce sync.Once
 }
 
-func newStream(client *Client, info StreamInfo, conn *tunnel.UDPConn, control *xpc.Conn) *Stream {
+func newStream(client *Client, device *coredevice.Device, release func(), info StreamInfo, conn *tunnel.UDPConn, control *xpc.Conn) *Stream {
 	stream := &Stream{
 		client:    client,
+		device:    device,
+		release:   release,
 		info:      info,
 		conn:      conn,
 		control:   control,
@@ -61,6 +68,8 @@ func newStream(client *Client, info StreamInfo, conn *tunnel.UDPConn, control *x
 		select {
 		case <-client.device.Done():
 			err = client.device.Err()
+		case <-device.Done():
+			err = device.Err()
 		case <-client.owner.Done():
 			err = context.Cause(client.owner)
 		case <-stream.done:
@@ -97,6 +106,7 @@ func (s *Stream) closeLocal() {
 	s.localOnce.Do(func() {
 		_ = s.control.Close()
 		_ = s.conn.Close()
+		s.release()
 	})
 }
 
@@ -262,7 +272,12 @@ func (s *Stream) Close() error {
 			s.keyFrameTimer = nil
 		}
 		s.keyFrameAccess.Unlock()
-		reply, err := s.client.stop(s.info.SSRC)
+		// A stream whose second tunnel ended is stopped through the first.
+		device := s.device
+		if device.Err() != nil {
+			device = s.client.device
+		}
+		reply, err := s.client.stop(device, s.info.SSRC)
 		if err != nil {
 			s.sendErr = E.Cause(err, "stop ", string(s.info.Type), " stream")
 			s.closeErr = s.sendErr
