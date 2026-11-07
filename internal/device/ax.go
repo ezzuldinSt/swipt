@@ -248,7 +248,7 @@ func (w *axWorker) open(ctx context.Context) (*accessibility.RemoteClient, error
 		w.dropClient()
 	}
 	s := w.conn.connection
-	if err := s.stallsAllowed(); err != nil {
+	if err := s.stallsAllowed(w.conn.front.lastPID()); err != nil {
 		return nil, err
 	}
 	if !s.axClean() {
@@ -303,7 +303,7 @@ func (w *axWorker) stalled(job *axJob, stall error) error {
 		_ = w.client.CloseCause(stall)
 		w.client = nil
 	}
-	w.conn.connection.recordStall()
+	w.conn.connection.recordStall(w.conn.front.lastPID())
 	w.conn.connection.setAXClean(false)
 	performed := ""
 	if job.action {
@@ -372,20 +372,32 @@ func (s *Connection) setAXClean(clean bool) {
 	s.access.Unlock()
 }
 
-func (s *Connection) recordStall() {
-	s.access.Lock()
-	defer s.access.Unlock()
-	s.stalls = append(common.Filter(s.stalls, func(at time.Time) bool { return time.Since(at) < stallWindow }), time.Now())
+// stall is when the accessibility service stopped answering, and the process
+// then in front, or 0 when none was known.
+type stall struct {
+	at  time.Time
+	pid uint64
 }
 
-func (s *Connection) stallsAllowed() error {
+// An application that does not answer axauditd stalls it each time it is in
+// front, while others go on answering (X, iPhone18,2, iOS 27.0.1 24A446): so
+// the stalls count against the application in front when they happened, and
+// one that keeps stalling it does not shut out the rest.
+func (s *Connection) recordStall(pid uint64) {
 	s.access.Lock()
 	defer s.access.Unlock()
-	s.stalls = common.Filter(s.stalls, func(at time.Time) bool { return time.Since(at) < stallWindow })
-	if len(s.stalls) < stallLimit {
+	s.stalls = append(common.Filter(s.stalls, func(it stall) bool { return time.Since(it.at) < stallWindow }), stall{at: time.Now(), pid: pid})
+}
+
+func (s *Connection) stallsAllowed(pid uint64) error {
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.stalls = common.Filter(s.stalls, func(it stall) bool { return time.Since(it.at) < stallWindow })
+	counted := common.Filter(s.stalls, func(it stall) bool { return pid == 0 || it.pid == pid })
+	if len(counted) < stallLimit {
 		return nil
 	}
-	return E.Cause1(ErrUnavailable, E.New("the device's accessibility service stopped answering ", len(s.stalls), " times in ", stallWindow,
-		" and was restarted each time; the application in front may not be answering it. It is tried again ",
-		time.Until(s.stalls[0].Add(stallWindow)).Round(time.Second), " from now"))
+	return E.Cause1(ErrUnavailable, E.New("the device's accessibility service stopped answering ", len(counted), " times in ", stallWindow,
+		" with the same application in front, and was restarted each time; that application may not be answering it. It is tried again ",
+		time.Until(counted[0].at.Add(stallWindow)).Round(time.Second), " from now, or at once with another application in front"))
 }

@@ -149,7 +149,7 @@ type Connection struct {
 	videoProblem   error
 	rfb            *rfb.Server
 	daemonClean    bool
-	stalls         []time.Time
+	stalls         []stall
 
 	frontends sync.Mutex
 	listening bool
