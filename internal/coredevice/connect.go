@@ -76,7 +76,7 @@ func ConnectRemotePairing(ctx context.Context, options RemotePairingOptions) (*D
 		session.Close()
 		return nil, err
 	}
-	return newDevice(ctx, tun, session, handshakeIdentity(options.Record.Identifier), options.Logger)
+	return newDevice(ctx, tun, session, handshakeIdentity(options.Record.Identifier), options.Logger, nil)
 }
 
 type LockdownOptions struct {
@@ -84,6 +84,9 @@ type LockdownOptions struct {
 	Dial    lockdown.Dialer
 	Record  *lockdown.PairRecord
 	Logger  logger.ContextLogger
+	// Bulk lets the display stream and screenshots go through a second
+	// tunnel, made the same way when they need it (see Device.Bulk).
+	Bulk bool
 }
 
 func ConnectLockdown(ctx context.Context, options LockdownOptions) (*Device, error) {
@@ -98,10 +101,10 @@ func ConnectLockdown(ctx context.Context, options LockdownOptions) (*Device, err
 		}
 	}
 	identity := handshakeIdentity(options.Record.HostID)
-	return connectLockdown(ctx, options.Record, dial, identity, options.Logger)
+	return connectLockdown(ctx, options.Record, dial, identity, options.Logger, options.Bulk)
 }
 
-func connectLockdown(ctx context.Context, record *lockdown.PairRecord, dial lockdown.Dialer, identity uuid.UUID, logger logger.ContextLogger) (*Device, error) {
+func connectLockdown(ctx context.Context, record *lockdown.PairRecord, dial lockdown.Dialer, identity uuid.UUID, logger logger.ContextLogger, bulk bool) (*Device, error) {
 	conn, err := lockdown.DialService(ctx, record, dial, lockdown.CoreDeviceProxy, logger)
 	if err != nil {
 		return nil, err
@@ -110,7 +113,13 @@ func connectLockdown(ctx context.Context, record *lockdown.PairRecord, dial lock
 	if err != nil {
 		return nil, err
 	}
-	return newDevice(ctx, tun, nil, identity, logger)
+	var connectBulk func(ctx context.Context) (*Device, error)
+	if bulk {
+		connectBulk = func(ctx context.Context) (*Device, error) {
+			return connectLockdown(ctx, record, dial, identity, logger, false)
+		}
+	}
+	return newDevice(ctx, tun, nil, identity, logger, connectBulk)
 }
 
 // pymobiledevice3 sends a stable host UUID in RSD handshakes

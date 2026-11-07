@@ -81,14 +81,15 @@ func (c *Client) operationContext(parent context.Context) (context.Context, cont
 }
 
 // The device returns stoppedStreams in the client-offered SSRC namespace
-// (observed on iPad17,1, iPadOS 27.2 24B5099f).
-func (c *Client) stop(ssrc uint32) (func() ([]uint32, error), error) {
+// (observed on iPad17,1, iPadOS 27.2 24B5099f). A stream is stopped through
+// the connection that started it, device.
+func (c *Client) stop(device *coredevice.Device, ssrc uint32) (func() ([]uint32, error), error) {
 	ctx, cancel := c.operationContext(c.owner)
 	if err := context.Cause(ctx); err != nil {
 		cancel()
 		return nil, err
 	}
-	conn, err := c.device.DialXPC(ctx, serviceName)
+	conn, err := device.DialXPC(ctx, serviceName)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -183,18 +184,22 @@ func (c *Client) start(ctx context.Context, streamType StreamType, options Strea
 	for options.SSRC == 0 {
 		options.SSRC = rand.Uint32()
 	}
-	conn, err := c.device.ListenUDP(0, options.ReadOptions)
+	began := time.Now()
+	device, release := c.device.Bulk(ctx, true)
+	opened := time.Now()
+	conn, err := device.ListenUDP(0, options.ReadOptions)
 	if err != nil {
+		release()
 		return nil, E.Cause(err, "start ", string(streamType), ": bind receiver")
 	}
 	input := startInput(streamType, options.SessionID, encodeOffer(streamType, options, time.Now()),
-		c.device.LocalAddress().String(), int(conn.Port()),
-		c.device.Address().String(), extraOptions)
+		device.LocalAddress().String(), int(conn.Port()),
+		device.Address().String(), extraOptions)
 
-	began := time.Now()
-	control, err := c.device.DialXPC(ctx, serviceName)
+	control, err := device.DialXPC(ctx, serviceName)
 	if err != nil {
 		conn.Close()
+		release()
 		return nil, E.Cause(err, "start ", string(streamType))
 	}
 	connected := time.Now()
@@ -204,22 +209,24 @@ func (c *Client) start(ctx context.Context, streamType StreamType, options Strea
 		control.Close()
 		conn.Close()
 		if _, isFeatureError := errors.AsType[*coredevice.FeatureError](err); !isFeatureError {
-			err = E.Errors(err, c.stopOffered(options.SSRC))
+			err = E.Errors(err, c.stopOffered(device, options.SSRC))
 		}
+		release()
 		return nil, E.Cause(err, "start ", string(streamType))
 	}
 	info, err := parseStartReply(output)
 	if err != nil {
 		control.Close()
 		conn.Close()
-		err = E.Errors(err, c.stopOffered(options.SSRC))
+		err = E.Errors(err, c.stopOffered(device, options.SSRC))
+		release()
 		return nil, E.Cause(err, "start ", string(streamType))
 	}
-	stream := newStream(c, info, conn, control)
+	stream := newStream(c, device, release, info, conn, control)
 	c.logger.Debug("display stream started: ", string(info.Type), ", SSRC ", info.SSRC, ", device SSRC ", info.DeviceSSRC,
 		", device ", info.DeviceAddress, ", ", info.Width, "x", info.Height, ", ", info.TilesPerFrame, " tiles, LTRP ", info.LTRP,
-		", sync token ", info.SyncToken, ", RTCP timeout ", info.RTCPTimeout,
-		", connected in ", connected.Sub(began), ", replied in ", answered.Sub(connected))
+		", sync token ", info.SyncToken, ", RTCP timeout ", info.RTCPTimeout, ", ", tunnelName(device != c.device),
+		" opened in ", opened.Sub(began), ", connected in ", connected.Sub(opened), ", replied in ", answered.Sub(connected))
 	err = stream.startKeepalive()
 	if err != nil {
 		return nil, E.Cause(E.Errors(err, stream.Close()), "start ", string(streamType))
@@ -227,8 +234,8 @@ func (c *Client) start(ctx context.Context, streamType StreamType, options Strea
 	return stream, nil
 }
 
-func (c *Client) stopOffered(ssrc uint32) error {
-	reply, err := c.stop(ssrc)
+func (c *Client) stopOffered(device *coredevice.Device, ssrc uint32) error {
+	reply, err := c.stop(device, ssrc)
 	if err != nil {
 		return E.Cause(err, "stop after a failed start")
 	}
@@ -238,4 +245,11 @@ func (c *Client) stopOffered(ssrc uint32) error {
 		}
 	}()
 	return nil
+}
+
+func tunnelName(bulk bool) string {
+	if bulk {
+		return "second tunnel"
+	}
+	return "tunnel"
 }
