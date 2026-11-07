@@ -97,7 +97,11 @@ func newRouter(udid, name string, relay bool, known *knownDevices, logger log.Co
 
 func dialDirect(ctx context.Context, address netip.AddrPort) (net.Conn, error) {
 	dialer := net.Dialer{Timeout: directDialTimeout, KeepAliveConfig: directKeepAlive}
-	return dialer.DialContext(ctx, "tcp", address.String())
+	conn, err := dialer.DialContext(ctx, "tcp", address.String())
+	if err == nil {
+		acknowledgeEach(conn)
+	}
+	return conn, err
 }
 
 func readPairRecord(ctx context.Context, udid string) (*lockdown.PairRecord, error) {
