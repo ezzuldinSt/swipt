@@ -69,7 +69,9 @@ func watchFeed(ctx context.Context, frames raster.Feed, release func()) (*screen
 }
 
 // screenWatch compares the frames of a lease with the one marked last,
-// leaving out the pixels that changed on their own before the mark.
+// leaving out the pixels that changed on their own before the mark. It
+// releases every frame it takes: a frame on the GPU holds the decoder's
+// Direct3D device, which stays with all its memory until the last frame goes.
 type screenWatch struct {
 	frames    raster.Feed
 	release   func()
@@ -86,11 +88,20 @@ func (w *screenWatch) Mark(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if w.earlier != nil {
+		w.earlier.Release()
+	}
 	w.earlier, w.reference, w.marked = w.reference, frame, time.Now()
 	return nil
 }
 
 func (w *screenWatch) Close() {
+	for _, frame := range []*raster.Image{w.reference, w.earlier} {
+		if frame != nil {
+			frame.Release()
+		}
+	}
+	w.reference, w.earlier = nil, nil
 	w.release()
 }
 
@@ -294,6 +305,11 @@ func (w *screenWatch) Change(ctx context.Context, target device.Rect, until time
 	var first time.Duration
 	var judge time.Time
 	var last *raster.Image
+	defer func() {
+		if last != nil {
+			last.Release()
+		}
+	}()
 	for {
 		wait := until
 		if !judge.IsZero() {
@@ -304,6 +320,9 @@ func (w *screenWatch) Change(ctx context.Context, target device.Rect, until time
 			return "", 0, err
 		}
 		if frame != nil {
+			if last != nil {
+				last.Release()
+			}
 			last = frame
 			if judge.IsZero() {
 				where, err := classify(frame)
