@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"time"
 )
 
 // Source makes the pixels of an image as calls read them: a frame of the live screen feed
@@ -199,12 +200,17 @@ func AveragedGray(pixels *image.NRGBA, width, height int, out []byte) {
 	averagedGray(rasterOf(pixels), width, height, out)
 }
 
-// lentLimit is how many buffers of lent pixels are kept for the next loans.
-const lentLimit = 2
+// lentLimit is how many buffers of lent pixels are kept for the next loans, for lentIdle after
+// the last: a buffer of the device's screen is 15 MB that an idle server need not keep.
+const (
+	lentLimit = 2
+	lentIdle  = 5 * time.Second
+)
 
 var lent struct {
 	access  sync.Mutex
 	buffers [][]byte
+	expiry  *time.Timer
 }
 
 func borrowPixels(size int) []byte {
@@ -226,6 +232,18 @@ func returnPixels(buffer []byte) {
 		lent.buffers = lent.buffers[1:]
 	}
 	lent.buffers = append(lent.buffers, buffer)
+	if lent.expiry == nil {
+		lent.expiry = time.AfterFunc(lentIdle, dropLent)
+	} else {
+		lent.expiry.Reset(lentIdle)
+	}
+}
+
+func dropLent() {
+	lent.access.Lock()
+	defer lent.access.Unlock()
+	clear(lent.buffers)
+	lent.buffers = lent.buffers[:0]
 }
 
 // UsePixels lends the image's pixels, an *image.NRGBA or an *image.Gray, to use, which must not
