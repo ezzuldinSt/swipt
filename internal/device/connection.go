@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,7 +92,15 @@ type Options struct {
 	// another way than the connected one; that one is then replaced. It is
 	// asked every routeCheckInterval.
 	Moved func(ctx context.Context, device *coredevice.Device) bool
+
+	// ScreenTiles is how many horizontal bands the screen feed's stream asks the device to
+	// encode each frame in, each its own RTP stream (display.StreamOptions.TilesPerFrame); 0
+	// takes ScreenTilesVariable, and one band is the default.
+	ScreenTiles int
 }
+
+// ScreenTilesVariable, set to 2 or 4, makes the screen feed ask for that many bands a frame.
+const ScreenTilesVariable = "SWIPT_SCREEN_TILES"
 
 type Settings struct {
 	AutoUnlockPasscode     string
@@ -159,6 +168,9 @@ func New(options Options) *Connection {
 	}
 	if options.IdleTimeout == 0 {
 		options.IdleTimeout = defaultIdleTimeout
+	}
+	if options.ScreenTiles == 0 {
+		options.ScreenTiles, _ = strconv.Atoi(os.Getenv(ScreenTilesVariable))
 	}
 	s := &Connection{
 		options:     options,
