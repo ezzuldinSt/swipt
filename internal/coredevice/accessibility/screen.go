@@ -115,7 +115,7 @@ func (c *RemoteClient) ReadScreen(ctx context.Context, springboard uint64, depth
 	})
 }
 
-var placementAttributes = []int64{nativeAutomationType, nativeTraits, nativeFrame, nativeVisibleFrame, nativeActivation, nativeContextID}
+var placementAttributes = []int64{nativeAutomationType, nativeIsElement, nativeTraits, nativeFrame, nativeVisibleFrame, nativeActivation, nativeContextID}
 
 var fieldAttributes = map[string][]int64{
 	"class":       {nativeClassName},
