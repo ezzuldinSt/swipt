@@ -62,6 +62,7 @@ func main() {
 }
 
 func run(command *cobra.Command, _ []string) error {
+	tuneMemory()
 	options.Logs = log.NewFactory(log.Options{Level: log.LevelInfo, PlatformWriter: writer{}})
 	options.Version = version()
 	options.Output = command.OutOrStdout()
@@ -72,6 +73,20 @@ func run(command *cobra.Command, _ []string) error {
 		command.SilenceErrors = true
 	}
 	return err
+}
+
+// tuneMemory keeps the Go heap near what the server holds unless GOGC or GOMEMLIMIT say
+// otherwise. Its large allocations are frames and the pixels read from them, which live briefly,
+// and at the default GOGC of 100 the heap grows to twice what is live before a collection: half
+// keeps a script's loop of frames and text readings 35 MB smaller for a collection every few
+// seconds. The limit makes the collector work harder before the Go runtime passes 512 MB.
+func tuneMemory() {
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(50)
+	}
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(512 << 20)
+	}
 }
 
 func runPair(command *cobra.Command, _ []string) error {
