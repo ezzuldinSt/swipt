@@ -41,7 +41,7 @@ type PairRecord struct {
 	UDID        string
 	Certificate tls.Certificate
 	// WiFiMACAddress is the device's Wi-Fi address, such as
-	// "66:83:3b:04:28:0f", which names its _apple-mobdev2._tcp instance.
+	// "a2:b4:c6:d8:e0:f2", which names its _apple-mobdev2._tcp instance.
 	WiFiMACAddress string
 }
 

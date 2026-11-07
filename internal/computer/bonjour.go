@@ -11,7 +11,7 @@ import (
 )
 
 // An iPhone on Wi-Fi advertises _apple-mobdev2._tcp as
-// "66:83:3b:04:28:0f@fe80::6483:3bff:fe04:280f-supportsRP-26", its Wi-Fi MAC
+// "a2:b4:c6:d8:e0:f2@fe80::a0b4:c6ff:fed8:e0f2-supportsRP-26", its Wi-Fi MAC
 // address first, the one its usbmuxd pair record holds as WiFiMACAddress.
 // Windows answered the browse in 4 ms and the resolve in 105 ms, with an IPv4
 // address that answered lockdown and a link-local IPv6 one that did not
