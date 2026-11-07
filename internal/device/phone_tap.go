@@ -254,9 +254,11 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 	attributes := batch.Attributes(target.AX)
 	hit := batch.HitTest(s.geometry.digitizer(at))
 	animating := batch.AnimationsInProgress(target.AX)
+	asked := time.Now()
 	if err := s.client.Run(ctx, batch); err != nil {
 		return Point{}, "", err
 	}
+	answered := time.Since(asked)
 	previous, previousAt := s.previous, s.previousAt
 	s.previous, s.previousAt = attributes.Value.Frame, time.Now()
 	switch {
@@ -274,7 +276,7 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 	if risky := riskyWord(attributes.Value); risky != "" {
 		s.target.Risky = risky
 	}
-	s.target.mark = Mark{element: &attributes.Value, front: target.model.Root.AX.Ref.PID, generation: target.model.generation}
+	s.target.mark = Mark{element: &attributes.Value, front: target.model.Root.AX.Ref.PID, generation: target.model.generation, latency: answered}
 	if animating.Code == 0 && animating.Value && time.Now().Before(s.settled) {
 		s.animating = true
 		return Point{}, name + " is animating", nil

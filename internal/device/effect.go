@@ -65,6 +65,9 @@ type Mark struct {
 	generation uint64
 	element    *accessibility.Element
 	displaced  string
+	// latency is the shortest round of accessibility requests around the touch, which bounds
+	// the round trip to the device then.
+	latency time.Duration
 }
 
 // Reaction is what the device reports changed after an input.
@@ -227,4 +230,10 @@ func roleOf(ax accessibility.Element) string {
 		}
 	}
 	return role(ax, false, names)
+}
+
+// Latency is the shortest round of accessibility requests around the input, which bounds the
+// round trip to the device then, or 0 when none was timed.
+func (m Mark) Latency() time.Duration {
+	return m.latency
 }

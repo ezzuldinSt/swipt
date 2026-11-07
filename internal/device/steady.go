@@ -83,7 +83,12 @@ func (s *axSession) afterTouch(ctx context.Context, target *PhoneNode, at Point)
 	batch := &accessibility.Batch{}
 	attributes := batch.Attributes(target.AX)
 	hit := batch.HitTest(s.geometry.digitizer(at))
-	if s.client.Run(ctx, batch) != nil || attributes.Code != 0 || attributes.Value.Frame == nil {
+	asked := time.Now()
+	if s.client.Run(ctx, batch) != nil {
+		return
+	}
+	s.target.mark.latency = min(s.target.mark.latency, time.Since(asked))
+	if attributes.Code != 0 || attributes.Value.Frame == nil {
 		return
 	}
 	was, now := target.space.rect(*before.Frame), target.space.rect(*attributes.Value.Frame)
