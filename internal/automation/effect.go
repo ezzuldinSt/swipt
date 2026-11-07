@@ -192,8 +192,10 @@ func pointTarget(at device.Point) device.Rect {
 // only after the window, nor on an element whose label makes acting on it
 // irreversible or outward, nor when recover is false.
 func (o *operation) tapElement(ctx context.Context, phone *device.Phone, ref string, timeout time.Duration, recover bool) (any, error) {
+	started := time.Now()
 	s := o.observe(ctx, phone)
 	defer s.close()
+	watched := time.Now()
 	result := tapResult{}
 	add := func(method string, aim device.Aim, outcome effect) {
 		result.Attempts = append(result.Attempts, tapAttempt{Method: method, Point: pointOf(aim.Point), Effect: outcome.Where, Detail: outcome.Detail})
@@ -209,21 +211,28 @@ func (o *operation) tapElement(ctx context.Context, phone *device.Phone, ref str
 		scrolledFirst = scrolled.Moved
 		result.Attempts = append(result.Attempts, tapAttempt{Method: "scroll", Detail: detail})
 	}
+	aiming := time.Now()
 	aim, err := phone.TapElement(ctx, ref, device.TapOptions{Timeout: timeout, Ready: s.ready})
 	o.record(aim, o.args[1:]...)
 	if err != nil {
 		return nil, err
 	}
+	tapped := time.Now()
 	doubt := aim.Doubt
 	if doubt == "" && scrolledFirst {
 		doubt = "it was scrolled into view first"
 	}
 	result.Element, result.Point = aim.Element, pointOf(aim.Point)
 	add("tap", aim, s.effect(ctx, aim.Mark(), aim.Visible))
+	o.trace(started, "tap.phases", "watching the screen "+msText(watched.Sub(started))+", placing "+msText(aiming.Sub(watched))+
+		", aiming and touching "+msText(tapped.Sub(aiming))+" (the touch "+msText(s.touched.Sub(aiming))+" in), the effect "+msText(time.Since(tapped))+": "+result.Effect)
 	switch {
 	case result.Effect != effectNone:
 		return compact(result), nil
 	case !recover:
+		return compact(result), nil
+	case s.watch == nil:
+		result.Detail += "; not tried again, as without the live screen nothing tells a missed tap from one that rightly changed nothing"
 		return compact(result), nil
 	case aim.Risky != "":
 		result.Detail += "; not tried again, as " + strconv.Quote(aim.Risky) + " may act irreversibly or outside the device"
@@ -312,4 +321,17 @@ func (o *operation) tapPoint(ctx context.Context, phone *device.Phone, at device
 	}
 	outcome := s.effect(ctx, mark, pointTarget(at))
 	return tapResult{Point: pointOf(at), Effect: outcome.Where, Detail: outcome.Detail}, nil
+}
+
+// trace records a step of the operation on the timeline, when someone watches
+// it.
+func (o *operation) trace(at time.Time, name, detail string) {
+	timeline := &o.engine.host.timeline
+	if !timeline.active() {
+		return
+	}
+	timeline.record(TimelineEvent{
+		Time: at.UnixMilli(), Type: "operation", Name: "trace." + name, Message: detail,
+		DurationMs: float64(time.Since(at).Microseconds()) / 1000, Swiplet: o.engine.swiplet.ID,
+	})
 }

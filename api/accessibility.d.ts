@@ -148,7 +148,8 @@ export interface ObserveOptions {
 }
 
 /**
- * "target": the screen changed at the element (or within 44 pt of a tapped point) after the touch, and was still changed 350 ms later; "elsewhere": it changed only away from it, or the device reported the element went, moved or another app came to the front.
+ * "target": the screen changed at the element (or within 44 pt of a tapped point) after the touch, and was still changed 350 ms later, or the element's value or selection changed; "elsewhere": it changed only away from it and stayed so, or the element went, or another app came to the front.
+ * Changes of at most four spots of 12 by 12 pt, as a ticking clock hand or a blinking caret make, changes in places that changed on their own before the touch, and the device's screen-change notifications alone do not count.
  * "moved": the element moved away from the touch as it went, as a list does that loads after a launch, so the touch most likely reached another element, which the detail names when the hit test can; the tap is not tried again.
  * "none": nothing changed within 800 ms, or the change went back, as a press highlight or an icon's bounce does. A correct tap can change nothing visible, as on a control already in that state, so "none" is advice, not an error.
  */
@@ -181,7 +182,7 @@ export interface TapElementOptions extends ElementOptions, ObserveOptions {
   /**
    * With verify, when nothing changed and the tap's point was in doubt, tries again in turn: at a safer point of the element, after scrolling it clear of the app's bars, and with its press action, stopping at the first that changes something; on by default.
    * The point is in doubt when the element was partial or off the screen, lay within 80 pt of the app's bars or by a cover, moved or animated before the tap, or the hit test answered another element.
-   * A whole, clear and steady element is never tried again: its tap may rightly change nothing, or show it after 800 ms, and a second tap would act twice. Nor is an element already selected, or one whose label or identifier names an irreversible or outward action (Send, Pay, Buy, Delete, Remove, Reset, Confirm, Allow, Call, Post, Share, Sign Out and the like, in English).
+   * A whole, clear and steady element is never tried again: its tap may rightly change nothing, or show it after 800 ms, and a second tap would act twice. Nor is any element when the live screen cannot be watched. Nor is an element already selected, or one whose label or identifier names an irreversible or outward action (Send, Pay, Buy, Delete, Remove, Reset, Confirm, Allow, Call, Post, Share, Sign Out and the like, in English).
    */
   readonly recover?: boolean;
   /** With a selector that matches nothing on the screen, searches the pages of the screen as find's `scroll` does. */

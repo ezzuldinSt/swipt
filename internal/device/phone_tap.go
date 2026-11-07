@@ -163,6 +163,9 @@ func (p *Phone) aimed(ctx context.Context, ref string, timeout time.Duration, na
 			if waited != "" {
 				detail += ", after " + waited
 			}
+			if s.rereads > 0 {
+				detail += ", the screen read again " + strconv.Itoa(s.rereads) + " times"
+			}
 			p.connection.trace(started, name+".element", detail, time.Since(started))
 			break
 		}
