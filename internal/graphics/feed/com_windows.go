@@ -25,7 +25,10 @@ const (
 	methodRelease        = 2
 )
 
-// call invokes a method and answers its HRESULT.
+// call invokes a method and answers its HRESULT. Pointers converted to uintptr in its arguments
+// escape to the heap, so a stack that grows in the call does not move what they point at.
+//
+//go:uintptrescapes
 func (o *comObject) call(method int, args ...uintptr) hresult {
 	all := make([]uintptr, 0, len(args)+1)
 	all = append(all, uintptr(unsafe.Pointer(o)))
@@ -119,7 +122,9 @@ func guidArguments(guid *windows.GUID) []uintptr {
 }
 
 // procedureCall calls an exported function that answers an HRESULT; a missing one answers
-// HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND).
+// HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND). Pointers in its arguments escape as in call.
+//
+//go:uintptrescapes
 func procedureCall(procedure *windows.LazyProc, args ...uintptr) hresult {
 	if procedure.Find() != nil {
 		return 0x8007007F
