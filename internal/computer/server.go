@@ -65,7 +65,10 @@ func Run(ctx context.Context, options Options) error {
 		return err
 	}
 	defer held.Close()
-	paired, err := chooseDevice(ctx, options.Device)
+	known := newKnownDevices(directory)
+	relay := relayForced(options.Relay, os.Getenv(RelayVariable))
+	deviceLogger := options.Logs.NewLogger("device")
+	paired, err := chooseReachable(ctx, options.Device, known, relay, deviceLogger)
 	if err != nil {
 		return err
 	}
@@ -88,8 +91,7 @@ func Run(ctx context.Context, options Options) error {
 			diskImage = diskImages(directory)
 		}
 	}
-	deviceLogger := options.Logs.NewLogger("device")
-	route := newRouter(paired.UDID, relayForced(options.Relay, os.Getenv(RelayVariable)), deviceLogger)
+	route := newRouter(paired.UDID, paired.Name, relay, known, deviceLogger)
 	connection := device.New(device.Options{
 		Name:    paired.Name,
 		Connect: route.connect,
