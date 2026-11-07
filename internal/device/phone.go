@@ -309,8 +309,10 @@ type PhoneNode struct {
 
 	order, end  int
 	scroll, win *PhoneNode
-	cover       *PhoneNode
-	shown       float64
+	// bar is the nearest bar holding the node, the node itself if it is one.
+	bar   *PhoneNode
+	cover *PhoneNode
+	shown float64
 	// overlapped tells that a cover lies over or right by the activation point.
 	overlapped bool
 }
