@@ -86,8 +86,9 @@ type host struct {
 }
 
 const (
-	// The external memory that makes the outermost call collect when it returns.
-	externalCollection = 256 << 20
+	// The external memory that makes the outermost call collect when it returns. A frame of the
+	// device's screen keeps 15 MB, so a script that reads frames in a loop keeps about four.
+	externalCollection = 64 << 20
 
 	valueSize    = unsafe.Sizeof(lib.TJSValue{})
 	scratchWords = 4
