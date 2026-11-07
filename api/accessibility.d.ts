@@ -152,8 +152,10 @@ export interface ObserveOptions {
  * Changes of at most four spots of 12 by 12 pt, as a ticking clock hand or a blinking caret make, changes in places that changed on their own before the touch, and the device's screen-change notifications alone do not count.
  * "moved": the element moved away from the touch as it went, as a list does that loads after a launch, so the touch most likely reached another element, which the detail names when the hit test can; the tap is not tried again.
  * "none": nothing changed within 800 ms, or the change went back, as a press highlight or an icon's bounce does. A correct tap can change nothing visible, as on a control already in that state, so "none" is advice, not an error.
+ * "unknown": the stream sent no frame the device captured after the window (or after the change could have held) within 1.5 s more, as a stalled link does, and the device reported nothing; the tap is not tried again.
+ * Frames count by when the device captured them, so a change captured before the touch reached the device and rendered, which came late, does not count.
  */
-export type TapEffect = "target" | "elsewhere" | "moved" | "none";
+export type TapEffect = "target" | "elsewhere" | "moved" | "none" | "unknown";
 
 export interface TapAttempt {
   /** "tap", "saferTap" (at the element's visible edge farthest from the app's bars), "scroll" (bringing it 80 pt clear of the bars) or "press" (its accessibility action). */
