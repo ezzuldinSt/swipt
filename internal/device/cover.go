@@ -120,19 +120,21 @@ func roleName(ax accessibility.Element) string {
 func (m *PhoneModel) uncover(over []cover, input *PhoneNode) {
 	var nodes []*PhoneNode
 	var barred []bool
-	var index func(node, scroll, window *PhoneNode, bar bool)
-	index = func(node, scroll, window *PhoneNode, bar bool) {
+	var index func(node, scroll, window, holder *PhoneNode, bar bool)
+	index = func(node, scroll, window, holder *PhoneNode, bar bool) {
 		if node.AX.Type == windowAutomationType {
 			window = node
 		}
-		bar = bar || slices.Contains(barRoles, roleName(node.AX))
-		node.order, node.scroll, node.win = len(nodes), scroll, window
+		if slices.Contains(barRoles, roleName(node.AX)) {
+			bar, holder = true, node
+		}
+		node.order, node.scroll, node.win, node.bar = len(nodes), scroll, window, holder
 		nodes, barred = append(nodes, node), append(barred, bar)
 		if scrolls(node.AX) {
 			scroll = node
 		}
 		for _, child := range node.Children {
-			index(child, scroll, window, bar)
+			index(child, scroll, window, holder, bar)
 		}
 		node.end = len(nodes)
 		if bar {
@@ -141,7 +143,7 @@ func (m *PhoneModel) uncover(over []cover, input *PhoneNode) {
 			}
 		}
 	}
-	index(m.Root, nil, nil, false)
+	index(m.Root, nil, nil, nil, false)
 	inKeyboard := func(node *PhoneNode) bool { return input != nil && input.holds(node) }
 	geometry := m.Root.space.geometry
 	largest := geometry.Width * geometry.Height * coverLargest
@@ -183,7 +185,11 @@ func (m *PhoneModel) uncover(over []cover, input *PhoneNode) {
 		} else {
 			later, _ := slices.BinarySearchFunc(unscrolled, node.end, func(it *PhoneNode, order int) int { return it.order - order })
 			for _, it := range unscrolled[later:] {
-				if it.win == node.win {
+				// The items of one bar sit side by side, their frames overlapping by a
+				// few points, under the bar's own glass and selection views: none of
+				// them covers another (the tabs of Clock's tab bar, iPhone18,2, iOS
+				// 27.0.1 24A446).
+				if it.win == node.win && (node.bar == nil || it.bar != node.bar) {
 					add(it)
 				}
 			}
