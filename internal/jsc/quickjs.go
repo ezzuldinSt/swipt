@@ -28,6 +28,8 @@ type Context struct {
 	cancelled atomic.Uint64
 	external  atomic.Int64
 	collect   atomic.Bool
+	// reported tells that external cost was reported since the engine last collected while idle.
+	reported atomic.Bool
 
 	// The rest belongs to the engine's goroutine.
 	tls          *libc.TLS
@@ -87,8 +89,12 @@ type host struct {
 
 const (
 	// The external memory that makes the outermost call collect when it returns. A frame of the
-	// device's screen keeps 15 MB, so a script that reads frames in a loop keeps about four.
-	externalCollection = 64 << 20
+	// device's screen keeps 15 MB, so a script that reads frames in a loop keeps one or two: a
+	// collection takes about a millisecond with the runtime loaded.
+	externalCollection = 16 << 20
+	// How long the engine waits for a command before it collects what its objects keep outside
+	// it, so the frames of a script that ended, or waits, go back to the feed.
+	idleCollection = time.Second
 
 	valueSize    = unsafe.Sizeof(lib.TJSValue{})
 	scratchWords = 4
@@ -124,9 +130,36 @@ func New() *Context {
 }
 
 func (c *Context) loop() {
+	var idle *time.Timer
 	for !c.quit {
-		c.execute(<-c.commands)
+		if !c.reported.Load() {
+			c.execute(<-c.commands)
+			continue
+		}
+		if idle == nil {
+			idle = time.NewTimer(idleCollection)
+		} else {
+			idle.Reset(idleCollection)
+		}
+		select {
+		case cmd := <-c.commands:
+			idle.Stop()
+			c.execute(cmd)
+		case <-idle.C:
+			c.reported.Store(false)
+			c.external.Store(0)
+			c.collect.Store(false)
+			c.collectGarbage()
+		}
 	}
+}
+
+// collectGarbage collects twice: the runtime keeps an image's handle in a WeakMap, and the handle
+// is the key of graphics.js's WeakMap of hosts, so the first collection lets the handle go and only
+// the second the host it was the key of.
+func (c *Context) collectGarbage() {
+	lib.XJS_RunGC(c.tls, c.runtime)
+	lib.XJS_RunGC(c.tls, c.runtime)
 }
 
 func (c *Context) execute(cmd *command) {
@@ -309,8 +342,13 @@ func (c *Context) NewHostObject(payload any, finalize func()) Value {
 
 // ReportExternalCost tells the engine about memory that its objects keep alive outside it, like
 // JSReportExtraMemoryCost: QuickJS counts only its own allocations, so a cycle that holds a large
-// host object would otherwise wait for its next collection long after the memory ran out.
+// host object would otherwise wait for its next collection long after the memory ran out. The
+// runtime keeps an image's handle in WeakMaps, whose entries QuickJS drops only when it collects
+// (gc_remove_weak_objects), so every image waits for the collections of collectGarbage.
 func (c *Context) ReportExternalCost(bytes int64) {
+	if bytes > 0 {
+		c.reported.Store(true)
+	}
 	if bytes > 0 && c.external.Add(bytes) >= externalCollection {
 		c.external.Store(0)
 		c.collect.Store(true)
@@ -563,7 +601,7 @@ func (c *Context) checkpoint() {
 	}
 	defer func() {
 		if c.collect.Swap(false) {
-			lib.XJS_RunGC(c.tls, c.runtime)
+			c.collectGarbage()
 		}
 	}()
 	for !c.terminated {
