@@ -22,6 +22,11 @@ const (
 	stallLimit   = 3
 	restartLimit = 10 * time.Second
 	silentLimit  = 10 * time.Second
+	// answerLimit bounds how long the service is left running for an
+	// application on the screen that answers nothing: SpringBoard answered
+	// nothing for about 90 s after X hung, and every read of any application
+	// waited behind it until then (iPhone18,2, iOS 27.0.1 24A446).
+	answerLimit = 15 * time.Second
 )
 
 type axRun func(ctx context.Context, client *accessibility.RemoteClient) (any, error)
@@ -55,6 +60,8 @@ type axWorker struct {
 	client     *accessibility.RemoteClient
 	daemon     uint64
 	blamed     uint64
+	// blamedSince is when the process blamed first answered nothing.
+	blamedSince time.Time
 }
 
 type silence struct {
@@ -201,7 +208,7 @@ func (w *axWorker) execute(job *axJob) (any, error) {
 	silent, isSilent := errors.AsType[*accessibility.SilentFrontmostError](err)
 	switch {
 	case err == nil:
-		w.blamed = 0
+		w.blamed, w.blamedSince = 0, time.Time{}
 	case errors.Is(err, accessibility.ErrStalled):
 		return nil, w.stalled(job, err)
 	case client.Err() != nil && w.conn.ctx.Err() == nil:
@@ -346,12 +353,15 @@ func (w *axWorker) stalled(job *axJob, stall error) error {
 	}
 	pid, subject, basis, shown := w.shown(named)
 	if shown {
-		w.blamed = pid
-		detail := subject + " has not answered the accessibility service yet: " + reason + "; " + basis + ", so the service is left running"
-		w.logger.Warn(detail)
-		return E.Extend(ErrNotAnswering, detail)
+		waited, due := w.notAnswered(pid, time.Now())
+		if !due {
+			detail := subject + " has not answered the accessibility service yet: " + reason + "; " + basis + ", so the service is left running"
+			w.logger.Warn(detail)
+			return E.Extend(ErrNotAnswering, detail)
+		}
+		basis += ", but it has answered nothing for " + waited.Round(time.Second).String()
 	}
-	w.blamed = 0
+	w.blamed, w.blamedSince = 0, time.Time{}
 	waited := "it waited on " + subject + "; " + basis
 	w.logger.Warn("the device's accessibility service stopped answering: ", reason, "; ", waited, ", so it is restarted")
 	if w.client != nil {
@@ -368,6 +378,16 @@ func (w *axWorker) stalled(job *axJob, stall error) error {
 		return E.Extend(ErrStalled, reason, "; ", waited, performed, "; restarting it failed: ", err)
 	}
 	return E.Extend(ErrStalled, reason, "; ", waited, performed, "; it was restarted, and the elements read before are gone; read the screen again")
+}
+
+// notAnswered records that pid, on the screen, answered nothing, and tells
+// how long it has since it first did, and whether that reached answerLimit.
+func (w *axWorker) notAnswered(pid uint64, now time.Time) (time.Duration, bool) {
+	if w.blamed != pid || w.blamedSince.IsZero() {
+		w.blamed, w.blamedSince = pid, now
+	}
+	waited := now.Sub(w.blamedSince)
+	return waited, waited >= answerLimit
 }
 
 func (w *axWorker) shown(named uint64) (pid uint64, subject, basis string, shown bool) {
