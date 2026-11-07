@@ -10,13 +10,13 @@ import (
 
 // A tunnel is one TCP connection, which carries every connection to the
 // device and its datagrams in order, so a transfer queues the requests behind
-// it. A second tunnel carries the display stream and screenshots instead: over
-// Wi-Fi, with screenshots transferring at 1.6-1.9 MB/s on the same tunnel,
-// getdisplayinfo took 94-117 ms at p90 and up to 116-169 ms, against 51-64 ms
-// and up to 71-77 ms with them on a second one, and 16 ms at p90 with nothing
-// transferring; while the screen streamed at 0.4-1 MB/s it took up to
-// 119-149 ms on the same tunnel and up to 45-51 ms on a second (iPhone18,2,
-// iOS 27.0.1 24A446, connected straight through a Wi-Fi access point).
+// it. A second tunnel carries the display stream and screenshots instead:
+// with screenshots transferring at 1.2-1.9 MB/s, getdisplayinfo took 104 ms at
+// p90 and up to 167 ms on the same tunnel, against 64 ms and up to 104 ms with
+// them on a second one (the medians of 11 runs each), and 15-24 ms at p90 with
+// nothing transferring; a stream of up to 1.1 MB/s made no difference
+// (iPhone18,2, iOS 27.0.1 24A446, connected straight through a Wi-Fi access
+// point).
 const (
 	// The second tunnel opened in 0.52-0.62 s over Wi-Fi (iPhone18,2, iOS
 	// 27.0.1 24A446). A transfer that waits for it takes the first after
