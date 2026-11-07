@@ -223,15 +223,20 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 		return Point{}, "", E.New(name, " has no position on the screen; perform one of its actions instead")
 	}
 	s.stale = true
+	// The application's own views drawn after an element are not always
+	// opaque to touches: bars lay unlabeled glass and layout views over their
+	// items (YouTube's tab bar, iPhone18,2, iOS 27.0.1 24A446). So an element
+	// they cover is refused only when the hit test does not answer it either;
+	// otherwise the tap goes ahead, in doubt, and its effect is checked.
+	covered := ""
 	switch {
 	case !target.AX.Enabled:
 		return Point{}, name + " is disabled", nil
 	case !target.Shown():
 		return Point{}, name + " is off the screen", nil
 	case target.coveredInApp() && !target.Inert:
-		s.fixed = true
-		return Point{}, name + " is covered by " + target.coverText() + ", which leaves " + strconv.Itoa(int(target.shown*100)) +
-			"% of it showing; scroll it clear of that rather than tapping it blind", nil
+		covered = name + " is covered by " + target.coverText() + ", which leaves " + strconv.Itoa(int(target.shown*100)) +
+			"% of it showing; scroll it clear of that rather than tapping it blind"
 	case target.Covered && !target.Inert:
 		return Point{}, name + " is covered by " + target.coverText(), nil
 	}
@@ -279,6 +284,9 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 		return Point{}, "the device does not tell which element is at " + pointText(at), nil
 	}
 	node := target.model.Node(hit.Value.Ref)
+	if covered != "" {
+		s.target.Doubt = "it lies under " + target.coverText() + ", though the hit test answered it"
+	}
 	switch {
 	case hit.Value.Ref == target.AX.Ref, node != nil && target.Contains(node):
 		return at, "", nil
@@ -300,6 +308,10 @@ func (s *axSession) aim(ctx context.Context, target *PhoneNode) (Point, string, 
 	if target.Inert {
 		s.blocker = &blocker{pid: target.AX.Ref.PID, modal: true}
 		return Point{}, name + " is behind a modal view, as a sheet or an alert", nil
+	}
+	if covered != "" {
+		s.stale, s.fixed = true, true
+		return Point{}, covered, nil
 	}
 	s.blocker = &blocker{pid: hit.Value.Ref.PID, ref: &hit.Value.Ref}
 	return Point{}, "a tap at " + pointText(at) + " would reach " + describeElement(hit.Value) + ", not " + name, nil
