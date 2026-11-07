@@ -193,6 +193,11 @@ type Placement struct {
 	Covered bool
 	// Scrolls tells that it is in a scroll view, which can bring it into view.
 	Scrolls bool
+	// Visible is the part of it on the screen.
+	Visible Rect
+	// Arrived is when its application came to the front, as far as the device told, or
+	// zero when it is not known to be in front.
+	Arrived time.Time
 }
 
 // Placement answers where the element lies, as its read had it.
@@ -206,7 +211,10 @@ func (p *Phone) Placement(ctx context.Context, ref string) (Placement, error) {
 	if err != nil {
 		return Placement{}, err
 	}
-	return Placement{Shown: node.Shown(), Covered: node.coveredInApp() && !node.Inert, Scrolls: node.scroller() != nil && node.HasFrame()}, nil
+	return Placement{
+		Shown: node.Shown(), Covered: node.coveredInApp() && !node.Inert, Scrolls: node.scroller() != nil && node.HasFrame(),
+		Visible: node.Visible, Arrived: c.front.arrival(node.model.Root.AX.Ref.PID),
+	}, nil
 }
 
 // Scrolled is how bringing an element into view went.

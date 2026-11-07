@@ -19,22 +19,49 @@ type ScreenWatcher interface {
 
 // ScreenWatch holds the live screen for one action and its retries.
 type ScreenWatch interface {
-	// Mark takes the newest frame as the one later frames are compared with.
+	// Mark takes the newest frame as the screen before the touch.
 	Mark(ctx context.Context) error
-	// Change waits for a frame after the mark that differs from it, and
-	// answers where the change shows once it has held a moment: "target"
-	// when the frames still differ at target, in points, "elsewhere" when
-	// they differ only below the status bar elsewhere, and ChangeTransient
-	// when they went back to the mark's look. It answers "" when no frame by
-	// until differs. after is the time from the mark to the first changed
-	// frame.
-	Change(ctx context.Context, target device.Rect, until time.Time) (where string, after time.Duration, err error)
+	// Change tells where the frames the device captured after the touch changed from the
+	// screen before it, and how (ScreenChange).
+	Change(ctx context.Context, query ChangeQuery) (ScreenChange, error)
+	// Settle waits, for up to limit, until the region and then the whole screen have not
+	// changed for quiet.
+	Settle(ctx context.Context, region device.Rect, quiet, limit time.Duration) error
 	Close()
 }
 
-// ChangeTransient is what ScreenWatch.Change answers for a change that went
-// back, as a press highlight does.
-const ChangeTransient = "transient"
+// ChangeQuery is what a watch looks for after a touch.
+type ChangeQuery struct {
+	// Target is where, in points, the touch's own effect shows.
+	Target device.Rect
+	// Touched is when the touch went, on the PC's clock; the frames the device captured
+	// before Touched plus Lead show the screen before it could answer.
+	Touched time.Time
+	Lead    time.Duration
+	// Window is how long after the touch a change may begin; Stall is how much longer the
+	// watch waits for the frames to tell, after which the change is unknown.
+	Window, Stall time.Duration
+}
+
+// ScreenChange is what a watch saw after a touch.
+type ScreenChange struct {
+	// Where is "target" or "elsewhere" for a change that lasted, ChangeTransient for one
+	// that went back, ChangeUnknown when the frames did not come in time to tell, and ""
+	// for none.
+	Where string
+	// After is the time from the touch to the first changed frame's capture.
+	After time.Duration
+	// ByArrival tells that the stream did not tell when the device captured its frames, so
+	// they were ordered by when they came.
+	ByArrival bool
+}
+
+// ChangeTransient and ChangeUnknown are what ScreenChange.Where answers for a change that
+// went back, as a press highlight does, and for frames that did not come in time.
+const (
+	ChangeTransient = "transient"
+	ChangeUnknown   = "unknown"
+)
 
 const (
 	// The first changed frame of a tap reached the PC 105 ms after the touch
@@ -47,6 +74,25 @@ const (
 	pushGrace = 200 * time.Millisecond
 	// How long a retried tap waits for its element.
 	retryLimit = time.Second
+	// How much longer than the window a watch waits for a frame the device captured after
+	// it, over a link that holds frames back, before the effect is unknown.
+	stallLimit = 1500 * time.Millisecond
+	// A frame the device captured within renderLead plus the touch's trip to the device
+	// shows the screen before the touch: UIKit draws a touch's answer a frame or two after
+	// it comes. The trip is the round of accessibility requests around the touch, which
+	// bounds the round trip, within shortestTrip and longestTrip, or defaultTrip when none
+	// was timed: round trips over Wi-Fi took 11 to 25 ms (iPhone18,2, iOS 27.0.1 24A446).
+	renderLead   = 30 * time.Millisecond
+	defaultTrip  = 25 * time.Millisecond
+	shortestTrip = 10 * time.Millisecond
+	longestTrip  = 200 * time.Millisecond
+	// A tap on an application that came to the front less than arrivalSettle ago waits up
+	// to arrivalLimit for the element's part of the screen, and then the whole screen, to stay
+	// still for settleQuiet first: Settings finished loading its list after the first read
+	// of it (iPhone18,2, iOS 27.0.1 24A446).
+	arrivalSettle = 1500 * time.Millisecond
+	settleQuiet   = 150 * time.Millisecond
+	arrivalLimit  = 1500 * time.Millisecond
 	// A point tap's target is this square around the point, the size of the
 	// smallest control Apple's guidelines allow, on each side of it.
 	pointReach = 44.0
@@ -57,6 +103,7 @@ const (
 	effectElsewhere = "elsewhere"
 	effectNone      = "none"
 	effectMoved     = "moved"
+	effectUnknown   = ChangeUnknown
 )
 
 // effect is what an input changed, as a script sees it.
@@ -141,20 +188,24 @@ func (s *observer) effect(ctx context.Context, mark device.Mark, target device.R
 	if displaced := mark.Displaced(); displaced != "" {
 		return effect{Where: effectMoved, Detail: displaced + ", so the touch most likely reached another element"}
 	}
-	until := s.touched.Add(effectWindow)
-	settle := until
-	transient := ""
+	settle := s.touched.Add(effectWindow)
+	transient, unknown, timing := "", "", ""
 	if s.watch != nil {
-		where, after, err := s.watch.Change(ctx, target, until)
+		change, err := s.watch.Change(ctx, ChangeQuery{Target: target, Touched: s.touched, Lead: leadOf(mark), Window: effectWindow, Stall: stallLimit})
+		if change.ByArrival {
+			timing = ", by when the frames came, as the stream did not yet tell when they were captured"
+		}
 		switch {
 		case err != nil:
 			s.call.engine.logger.Debug(E.Cause(err, "watch the screen after ", s.call.name))
-		case where == effectTarget:
-			return effect{Where: effectTarget, Detail: "the screen changed at it " + msText(after) + " after the touch, and stayed changed"}
-		case where == effectElsewhere:
-			return effect{Where: effectElsewhere, Detail: "the screen changed away from it " + msText(after) + " after the touch, and stayed changed"}
-		case where == ChangeTransient:
-			transient = "the screen changed " + msText(after) + " after the touch and went back, as a press highlight does; "
+		case change.Where == effectTarget:
+			return effect{Where: effectTarget, Detail: "the screen changed at it " + msText(change.After) + " after the touch, and stayed changed" + timing}
+		case change.Where == effectElsewhere:
+			return effect{Where: effectElsewhere, Detail: "the screen changed away from it " + msText(change.After) + " after the touch, and stayed changed" + timing}
+		case change.Where == ChangeTransient:
+			transient = "the screen changed " + msText(change.After) + " after the touch and went back, as a press highlight does; "
+		case change.Where == ChangeUnknown:
+			unknown = "the stream sent no frame the device captured " + msText(effectWindow) + " after the touch within " + msText(effectWindow+stallLimit) + "; "
 		}
 		settle = time.Now().Add(pushGrace)
 	}
@@ -162,16 +213,27 @@ func (s *observer) effect(ctx context.Context, mark device.Mark, target device.R
 	if err != nil && ctx.Err() == nil {
 		s.call.engine.logger.Debug(E.Cause(err, "read what ", s.call.name, " changed"))
 	}
-	if reaction.Where != "" {
-		return effect{Where: reaction.Where, Detail: transient + reaction.Detail}
-	}
-	if s.watch == nil {
+	switch {
+	case reaction.Where != "":
+		return effect{Where: reaction.Where, Detail: transient + unknown + reaction.Detail}
+	case unknown != "":
+		return effect{Where: effectUnknown, Detail: unknown + "nothing tells whether the tap changed the screen"}
+	case s.watch == nil:
 		return effect{Where: effectNone, Detail: "the device reported no change within " + msText(time.Since(s.touched)) + ", without the live screen to watch"}
-	}
-	if transient != "" {
+	case transient != "":
 		return effect{Where: effectNone, Detail: transient + "nothing else changed"}
 	}
-	return effect{Where: effectNone, Detail: "nothing changed on the screen within " + msText(effectWindow)}
+	return effect{Where: effectNone, Detail: "nothing changed on the screen within " + msText(effectWindow) + timing}
+}
+
+// leadOf is how long after a touch the frames the device captured may show it: its trip to the
+// device, at most the round of accessibility requests around it, and the render.
+func leadOf(mark device.Mark) time.Duration {
+	trip := mark.Latency()
+	if trip <= 0 {
+		trip = defaultTrip
+	}
+	return min(max(trip, shortestTrip), longestTrip) + renderLead
 }
 
 func msText(duration time.Duration) string {
@@ -202,7 +264,8 @@ func (o *operation) tapElement(ctx context.Context, phone *device.Phone, ref str
 		result.Effect, result.Detail = outcome.Where, outcome.Detail
 	}
 	var scrolledFirst bool
-	if placement, err := phone.Placement(ctx, ref); err == nil && placement.Scrolls && (!placement.Shown || placement.Covered) {
+	placement, placed := phone.Placement(ctx, ref)
+	if placed == nil && placement.Scrolls && (!placement.Shown || placement.Covered) {
 		scrolled, err := phone.ScrollIntoView(ctx, ref)
 		detail := scrolled.Detail
 		if err != nil {
@@ -210,6 +273,11 @@ func (o *operation) tapElement(ctx context.Context, phone *device.Phone, ref str
 		}
 		scrolledFirst = scrolled.Moved
 		result.Attempts = append(result.Attempts, tapAttempt{Method: "scroll", Detail: detail})
+	}
+	if placed == nil && s.watch != nil && !placement.Arrived.IsZero() && time.Since(placement.Arrived) < arrivalSettle {
+		if err := s.watch.Settle(ctx, placement.Visible, settleQuiet, arrivalLimit); err != nil && ctx.Err() == nil {
+			o.engine.logger.Debug(E.Cause(err, "wait for the screen to settle before ", o.name))
+		}
 	}
 	aiming := time.Now()
 	aim, err := phone.TapElement(ctx, ref, device.TapOptions{Timeout: timeout, Ready: s.ready})

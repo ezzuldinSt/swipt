@@ -4,6 +4,7 @@ package graphics
 
 import (
 	"context"
+	"encoding/json"
 	"image"
 	"math"
 	"time"
@@ -65,7 +66,9 @@ func watchFeed(ctx context.Context, frames raster.Feed, release func()) (*screen
 		release()
 		return nil, err
 	}
-	return &screenWatch{frames: frames, release: release, reference: reference, marked: time.Now()}, nil
+	watch := &screenWatch{frames: frames, release: release, reference: reference}
+	_, watch.timed = watch.captured(reference)
+	return watch, nil
 }
 
 // screenWatch compares the frames of a lease with the one marked last,
@@ -78,8 +81,9 @@ type screenWatch struct {
 	reference *raster.Image
 	// earlier is the frame before the reference, from the watch's start or
 	// the mark before, which the baseline compares the reference with.
-	earlier  *raster.Image
-	marked   time.Time
+	earlier *raster.Image
+	// timed tells that the feed told when the device captured the reference.
+	timed    bool
 	baseline []bool
 }
 
@@ -91,17 +95,19 @@ func (w *screenWatch) Mark(ctx context.Context) error {
 	if w.earlier != nil {
 		w.earlier.Release()
 	}
-	w.earlier, w.reference, w.marked = w.reference, frame, time.Now()
+	w.earlier, w.reference = w.reference, frame
+	_, w.timed = w.captured(frame)
 	return nil
 }
 
+// Close releases the frames the watch holds and its lease.
 func (w *screenWatch) Close() {
-	for _, frame := range []*raster.Image{w.reference, w.earlier} {
+	for _, frame := range []*raster.Image{w.earlier, w.reference} {
 		if frame != nil {
 			frame.Release()
 		}
 	}
-	w.reference, w.earlier = nil, nil
+	w.earlier, w.reference = nil, nil
 	w.release()
 }
 
@@ -267,34 +273,60 @@ func (p *screenPlane) baselineOf(before, after *image.Gray) []bool {
 	return out
 }
 
-// Change answers where the frames first changed from the mark's, once the
-// change has held for persistHold: a press highlight or an icon's bounce that
-// goes back to the marked look by then is transient, not an effect. Changes
-// of a few small spots, and pixels that changed on their own before the mark,
-// do not count.
-func (w *screenWatch) Change(ctx context.Context, target device.Rect, until time.Time) (string, time.Duration, error) {
+// captured is when the device captured the frame the feed answered last, on the PC's clock in
+// milliseconds since the epoch, and whether the feed knew it; it falls back on the frame's
+// arrival.
+func (w *screenWatch) captured(frame *raster.Image) (float64, bool) {
+	if timed, ok := w.frames.(capturedTeller); ok {
+		if at := timed.Captured(); !math.IsNaN(at) {
+			return at, true
+		}
+	}
+	if at := frame.Timestamp(); !math.IsNaN(at) {
+		return at, false
+	}
+	return milliseconds(time.Now()), false
+}
+
+// capturedTeller is a feed that tells when the device captured the frame it answered last
+// (feed.Lease.Captured).
+type capturedTeller interface {
+	Captured() float64
+}
+
+func milliseconds(at time.Time) float64 {
+	return float64(at.UnixMicro()) / 1000
+}
+
+func since(at float64, from time.Time) time.Duration {
+	return max(time.Duration((at-milliseconds(from))*float64(time.Millisecond)), 0)
+}
+
+// Change answers where the frames the device captured after the touch changed from the screen
+// before it, once the change has held for persistHold of capture time. The frames are ordered
+// by when the device captured them, not by when they came, so a change the device showed
+// before the touch that came after it, as the end of a list's load did over a jittery Wi-Fi
+// link, moves the screen before the touch instead of counting. A change that goes back is
+// transient; changes of a few small spots, and pixels that changed on their own before the
+// touch, do not count. When no frame captured after the window, or after the change held,
+// comes by the window and the stall allowance, the answer is unknown, not "nothing".
+func (w *screenWatch) Change(ctx context.Context, query automation.ChangeQuery) (automation.ScreenChange, error) {
 	plane, err := newScreenPlane(w.reference)
 	if err != nil {
-		return "", 0, err
+		return automation.ScreenChange{}, err
 	}
 	before, err := plane.of(ctx, w.reference)
 	if err != nil {
-		return "", 0, err
+		return automation.ScreenChange{}, err
 	}
 	if w.earlier != nil {
 		if earlier, err := plane.of(ctx, w.earlier); err == nil {
-			if fresh := plane.baselineOf(earlier, before); fresh != nil {
-				if len(w.baseline) != len(fresh) {
-					w.baseline = fresh
-				} else {
-					for index, on := range fresh {
-						w.baseline[index] = w.baseline[index] || on
-					}
-				}
-			}
+			w.addBaseline(plane.baselineOf(earlier, before))
 		}
+		w.earlier.Release()
+		w.earlier = nil
 	}
-	reach := device.Rect{X: target.X - targetMargin, Y: target.Y - targetMargin, Width: target.Width + 2*targetMargin, Height: target.Height + 2*targetMargin}
+	reach := device.Rect{X: query.Target.X - targetMargin, Y: query.Target.Y - targetMargin, Width: query.Target.Width + 2*targetMargin, Height: query.Target.Height + 2*targetMargin}
 	classify := func(frame *raster.Image) (string, error) {
 		after, err := plane.of(ctx, frame)
 		if err != nil {
@@ -302,63 +334,133 @@ func (w *screenWatch) Change(ctx context.Context, target device.Rect, until time
 		}
 		return plane.where(plane.changes(before, after, w.baseline), reach), nil
 	}
-	var first time.Duration
-	var judge time.Time
-	var last *raster.Image
-	defer func() {
-		if last != nil {
-			last.Release()
-		}
-	}()
+	shown := milliseconds(query.Touched.Add(query.Lead))
+	windowEnd := milliseconds(query.Touched.Add(query.Window))
+	deadline := query.Touched.Add(query.Window + query.Stall)
+	result := automation.ScreenChange{ByArrival: !w.timed}
+	var judge float64
 	for {
-		wait := until
-		if !judge.IsZero() {
-			wait = judge
-		}
-		frame, err := w.frames.Next(ctx, wait)
+		frame, err := w.frames.Next(ctx, deadline)
 		if err != nil {
-			return "", 0, err
+			return result, err
 		}
-		if frame != nil {
-			if last != nil {
-				last.Release()
-			}
-			last = frame
-			if judge.IsZero() {
-				where, err := classify(frame)
-				if err != nil {
-					return "", 0, err
+		if frame == nil {
+			result.Where = automation.ChangeUnknown
+			return result, nil
+		}
+		at, known := w.captured(frame)
+		result.ByArrival = result.ByArrival || !known
+		if at < shown {
+			// The device captured it before the touch could show: it is the screen before the
+			// touch, and what changed on its own since the last such frame joins the baseline.
+			if judge == 0 {
+				if current, err := plane.of(ctx, frame); err == nil {
+					w.addBaseline(plane.baselineOf(before, current))
+					before = current
 				}
-				if where != "" {
-					first, judge = max(w.since(frame), time.Millisecond), time.Now().Add(persistHold)
+				w.reference.Release()
+				w.reference = frame
+			} else {
+				frame.Release()
+			}
+			continue
+		}
+		if judge == 0 {
+			where, err := classify(frame)
+			if err != nil {
+				frame.Release()
+				return result, err
+			}
+			if where == "" {
+				frame.Release()
+				if at >= windowEnd {
+					return result, nil
 				}
 				continue
 			}
-			if time.Now().Before(judge) {
-				continue
-			}
+			result.After, judge = since(at, query.Touched), at+float64(persistHold.Milliseconds())
+			frame.Release()
+			continue
 		}
-		if judge.IsZero() {
-			return "", 0, nil
+		if at < judge {
+			frame.Release()
+			continue
 		}
-		where, err := classify(last)
+		where, err := classify(frame)
+		frame.Release()
 		if err != nil {
-			return "", 0, err
+			return result, err
 		}
 		if where == "" {
-			return automation.ChangeTransient, first, nil
+			where = automation.ChangeTransient
 		}
-		return where, first, nil
+		result.Where = where
+		return result, nil
 	}
 }
 
-// since is the time from the mark to the frame's arrival.
-func (w *screenWatch) since(frame *raster.Image) time.Duration {
-	if arrived := frame.Timestamp(); !math.IsNaN(arrived) {
-		return max(time.UnixMicro(int64(arrived*1000)).Sub(w.marked), 0)
+func (w *screenWatch) addBaseline(fresh []bool) {
+	if fresh == nil {
+		return
 	}
-	return time.Since(w.marked)
+	if len(w.baseline) != len(fresh) {
+		w.baseline = fresh
+		return
+	}
+	for index, on := range fresh {
+		w.baseline[index] = w.baseline[index] || on
+	}
 }
+
+// Settle waits, for up to limit, until the region and then the whole screen have not changed
+// for quiet, by waitForStable's rule.
+func (w *screenWatch) Settle(ctx context.Context, region device.Rect, quiet, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
+	for _, area := range []*raster.Rect{{region.X, region.Y, region.Width, region.Height}, nil} {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return nil
+		}
+		arguments := map[string]any{"durationMs": quiet.Milliseconds(), "timeoutMs": left.Milliseconds()}
+		if area != nil {
+			if region.Empty() {
+				continue
+			}
+			arguments["region"] = area
+		}
+		encoded, _ := json.Marshal(arguments)
+		if _, err := raster.Run(ctx, "screen.waitForStable", encoded, nil, settleEnv{frames: w.frames}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// settleEnv gives a wait the watch's feed and drops the frame it answers.
+type settleEnv struct {
+	frames raster.Feed
+}
+
+func (e settleEnv) Feed() raster.Feed { return e.frames }
+
+func (settleEnv) Keep(object any) int64 {
+	if image, ok := object.(*raster.Image); ok {
+		image.Release()
+	}
+	return 0
+}
+
+func (settleEnv) Authorize(string, bool) error {
+	return E.New("graphics: a settling wait reads no files")
+}
+
+func (settleEnv) Screenshot(context.Context) ([]byte, float64, error) {
+	return nil, 0, E.New("graphics: a settling wait takes no screenshots")
+}
+
+func (settleEnv) Tracing() bool { return false }
+
+func (settleEnv) Trace(time.Time, string, string, time.Duration) {}
 
 const (
 	automationTarget    = "target"
