@@ -452,12 +452,6 @@ func newRGBA(width, height int) *image.NRGBA {
 	return &image.NRGBA{Pix: pix, Stride: width * 4, Rect: image.Rect(0, 0, width, height)}
 }
 
-// recycleRGBA returns the bytes of an image made by newRGBA once nothing reads them.
-func recycleRGBA(pixels *image.NRGBA) {
-	buffer := pixels.Pix[:0]
-	rgbaPool.Put(&buffer)
-}
-
 // parallel splits count rows into a band for each processor.
 func parallel(count int, work func(start, end int)) {
 	workers := min(runtime.GOMAXPROCS(0), count)
