@@ -44,6 +44,11 @@ func (r Rect) inset(by float64) Rect {
 
 // overlaps holds for rects that share at least a point square, so neighbours
 // that touch or overlap by rounding do not cover each other.
+// holds tells whether other lies within r, give or take a point.
+func (r Rect) holds(other Rect) bool {
+	return other.X >= r.X-1 && other.Y >= r.Y-1 && other.X+other.Width <= r.X+r.Width+1 && other.Y+other.Height <= r.Y+r.Height+1
+}
+
 func (r Rect) overlaps(other Rect) bool {
 	shared := r.Intersect(other)
 	return shared.Width >= 1 && shared.Height >= 1
@@ -186,10 +191,11 @@ func (m *PhoneModel) uncover(over []cover, input *PhoneNode) {
 			later, _ := slices.BinarySearchFunc(unscrolled, node.end, func(it *PhoneNode, order int) int { return it.order - order })
 			for _, it := range unscrolled[later:] {
 				// The items of one bar sit side by side, their frames overlapping by a
-				// few points, under the bar's own glass and selection views: none of
-				// them covers another (the tabs of Clock's tab bar, iPhone18,2, iOS
-				// 27.0.1 24A446).
-				if it.win == node.win && (node.bar == nil || it.bar != node.bar) {
+				// few points, and the bar's glass and selection layers, which are no
+				// accessibility elements, lie over its area after it, outside the bar
+				// itself: neither covers an item of the bar (the tabs of Clock's tab
+				// bar, iPhone18,2, iOS 27.0.1 24A446).
+				if it.win == node.win && (node.bar == nil || it.bar != node.bar && (it.AX.AccessibilityElement || !node.bar.Visible.holds(it.Visible))) {
 					add(it)
 				}
 			}
