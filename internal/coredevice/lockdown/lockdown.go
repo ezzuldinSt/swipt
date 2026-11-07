@@ -40,6 +40,9 @@ type PairRecord struct {
 	SystemBUID  string
 	UDID        string
 	Certificate tls.Certificate
+	// WiFiMACAddress is the device's Wi-Fi address, such as
+	// "66:83:3b:04:28:0f", which names its _apple-mobdev2._tcp instance.
+	WiFiMACAddress string
 }
 
 // jitterbugpair writes the usbmuxd pair record with the device's UDID added
@@ -51,6 +54,7 @@ type pairRecordFile struct {
 	UDID            string `plist:"UDID"`
 	HostCertificate []byte `plist:"HostCertificate"`
 	HostPrivateKey  []byte `plist:"HostPrivateKey"`
+	WiFiMACAddress  string `plist:"WiFiMACAddress"`
 }
 
 func ParsePairRecord(data []byte) (*PairRecord, error) {
@@ -64,10 +68,11 @@ func ParsePairRecord(data []byte) (*PairRecord, error) {
 		return nil, E.Cause(err, "load pair record certificate")
 	}
 	return &PairRecord{
-		HostID:      file.HostID,
-		SystemBUID:  file.SystemBUID,
-		UDID:        file.UDID,
-		Certificate: certificate,
+		HostID:         file.HostID,
+		SystemBUID:     file.SystemBUID,
+		UDID:           file.UDID,
+		Certificate:    certificate,
+		WiFiMACAddress: file.WiFiMACAddress,
 	}, nil
 }
 
