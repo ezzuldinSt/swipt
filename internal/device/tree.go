@@ -2,7 +2,9 @@ package device
 
 import (
 	"context"
+	"errors"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,12 +25,21 @@ import (
 // read last is read again in the background, so that the next snapshot or
 // find finds it ready; this goes on for treeSettle after the action, as long
 // as that tree was read within treeInterest.
+//
+// An application answers a tree read on its main thread, so reading again
+// after every action weighs on one that answers slowly: X answered in several
+// seconds or not at all, and axauditd stalled once every few actions
+// (iPhone18,2, iOS 27.0.1 24A446). The background read leaves an application
+// alone for treeSlowLife after one of its reads took treeSlow or more, or it
+// stalled axauditd or left it waiting; snapshots and finds still read it.
 const (
 	treeLife     = 3 * time.Second
 	treeQuiet    = 250 * time.Millisecond
 	treeSettle   = 3 * time.Second
 	treeInterest = 30 * time.Second
 	treeWanted   = 1
+	treeSlow     = 1500 * time.Millisecond
+	treeSlowLife = 2 * time.Minute
 )
 
 // treeMark is what must not change for a tree to stay current.
@@ -68,10 +79,52 @@ type treeCache struct {
 	wants    []treeWant
 	flights  map[string]*treeFlight
 	settleBy time.Time
+	// pids is the process each tree was read from last, and slow when each
+	// slow process is left alone until.
+	pids      map[string]uint64
+	slow      map[uint64]time.Time
+	slowAfter time.Duration
 }
 
 func newTreeCache(c *conn) *treeCache {
-	return &treeCache{conn: c, acted: make(chan struct{}, 1), entries: make(map[string]treeEntry), flights: make(map[string]*treeFlight)}
+	return &treeCache{
+		conn: c, acted: make(chan struct{}, 1), entries: make(map[string]treeEntry), flights: make(map[string]*treeFlight),
+		pids: make(map[string]uint64), slow: make(map[uint64]time.Time), slowAfter: treeSlow,
+	}
+}
+
+// noted records which process a tree came from, and marks it slow when its
+// read took long, stalled axauditd, or went unanswered.
+func (t *treeCache) noted(key string, model *PhoneModel, took time.Duration, err error) {
+	pid := t.conn.front.lastPID()
+	if model != nil && model.Root != nil && model.Root.AX.Ref.PID != 0 {
+		pid = model.Root.AX.Ref.PID
+	}
+	if pid == 0 {
+		return
+	}
+	t.access.Lock()
+	defer t.access.Unlock()
+	t.pids[key] = pid
+	if took >= t.slowAfter || errors.Is(err, ErrStalled) || errors.Is(err, ErrNotAnswering) {
+		t.slow[pid] = time.Now().Add(treeSlowLife)
+	}
+}
+
+// slowFor tells whether the tree for key comes from a process the background
+// read leaves alone, and which.
+func (t *treeCache) slowFor(key string) (uint64, bool) {
+	t.access.Lock()
+	pid := t.pids[key]
+	until, slow := t.slow[pid]
+	t.access.Unlock()
+	if pid == 0 {
+		return 0, false
+	}
+	if slow && time.Now().Before(until) {
+		return pid, true
+	}
+	return pid, t.conn.connection != nil && t.conn.connection.stalledLately(pid)
 }
 
 func (t *treeCache) mark() treeMark {
@@ -185,6 +238,7 @@ func (t *treeCache) load(ctx context.Context, key string, load treeLoad, backgro
 		close(flight.done)
 	}()
 	model, err := load(ctx, background)
+	t.noted(key, model, time.Since(began), err)
 	if err == nil && t.acting.Load() == 0 {
 		t.store(key, model, mark, began)
 	}
@@ -244,6 +298,10 @@ func (t *treeCache) run() {
 		for _, want := range t.stale(t.mark()) {
 			if t.acting.Load() != 0 || ctx.Err() != nil {
 				break
+			}
+			if pid, slow := t.slowFor(want.key); slow {
+				record(time.Now(), "tree.background", "skipped: process "+strconv.FormatUint(pid, 10)+" answers slowly", 0)
+				continue
 			}
 			// A failed read in the background waits for the next action.
 			if _, err := t.load(ctx, want.key, want.load, true); err != nil {

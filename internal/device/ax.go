@@ -516,6 +516,14 @@ func (s *Connection) recordStall(pid uint64) {
 	s.stalls = append(common.Filter(s.stalls, func(it stall) bool { return time.Since(it.at) < stallWindow }), stall{at: time.Now(), pid: pid})
 }
 
+// stalledLately tells whether the process stalled axauditd within
+// stallWindow.
+func (s *Connection) stalledLately(pid uint64) bool {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return slices.ContainsFunc(s.stalls, func(it stall) bool { return it.pid == pid && time.Since(it.at) < stallWindow })
+}
+
 func (s *Connection) stallsAllowed(pid uint64) error {
 	s.access.Lock()
 	defer s.access.Unlock()
