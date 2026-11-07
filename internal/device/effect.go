@@ -88,17 +88,21 @@ func (p *Phone) MarkScreen(ctx context.Context) (Mark, error) {
 
 // Reaction waits until the device reports a change of the screen after the
 // mark, or until until, and then reads the element marked: whether another
-// application came to the front, the element went or moved, or its value or
-// selection changed. The device pushes a screen change 0.75 s after the change
-// at the soonest, so an input that changed nothing it can see costs the whole
-// wait.
+// application came to the front, the element went, or its value or selection
+// changed. The report alone is no reaction: Settings, still loading after a
+// relaunch, sent screen changes while a tap whose touch the floating search
+// bar took opened nothing (iPhone18,2, iOS 27.0.1 24A446). Nor is a move of
+// the element, which a loading list makes too. The device pushes a screen
+// change 0.75 s after the change at the soonest, so an input that changed
+// nothing costs the whole wait.
 func (p *Phone) Reaction(ctx context.Context, mark Mark, until time.Time) (Reaction, error) {
 	c, ctx, done, err := p.begin(ctx)
 	if err != nil {
 		return Reaction{}, err
 	}
 	defer done()
-	if mark.conn != c {
+	before := mark.element
+	if mark.conn != c || before == nil {
 		return Reaction{}, nil
 	}
 	changed, stop := c.events.watch(true)
@@ -118,14 +122,6 @@ func (p *Phone) Reaction(ctx context.Context, mark Mark, until time.Time) (React
 		}
 		timer.Stop()
 	}
-	pushed := Reaction{}
-	if c.events.screen.Load() != mark.screens {
-		pushed = Reaction{Where: "elsewhere", Detail: "the device reported a change of the screen"}
-	}
-	before := mark.element
-	if before == nil {
-		return pushed, nil
-	}
 	var front, attributes *accessibility.Result[accessibility.Element]
 	var mapped *accessibility.Result[bool]
 	err = c.ax.do(ctx, false, mark.generation, func(ctx context.Context, client *accessibility.RemoteClient) error {
@@ -134,7 +130,7 @@ func (p *Phone) Reaction(ctx context.Context, mark Mark, until time.Time) (React
 		return client.Run(ctx, batch)
 	})
 	if err != nil {
-		return pushed, err
+		return Reaction{}, err
 	}
 	name := describeElement(*before)
 	after := attributes.Value
@@ -152,10 +148,8 @@ func (p *Phone) Reaction(ctx context.Context, mark Mark, until time.Time) (React
 			return Reaction{Where: "target", Detail: name + " became selected"}, nil
 		}
 		return Reaction{Where: "target", Detail: name + " is no longer selected"}, nil
-	case !nearFrame(after.Frame, before.Frame):
-		return Reaction{Where: "elsewhere", Detail: name + " moved"}, nil
 	}
-	return pushed, nil
+	return Reaction{}, nil
 }
 
 // HitElement is the element a hit test reached.
