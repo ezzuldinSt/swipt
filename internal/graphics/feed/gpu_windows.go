@@ -115,7 +115,10 @@ type mappedResource struct {
 	rowPitch, depthPitch uint32
 }
 
-// callValue invokes a method that answers a value rather than an HRESULT.
+// callValue invokes a method that answers a value rather than an HRESULT; pointers escape as
+// in call.
+//
+//go:uintptrescapes
 func (o *comObject) callValue(method int, args ...uintptr) uintptr {
 	all := make([]uintptr, 0, len(args)+1)
 	all = append(all, uintptr(unsafe.Pointer(o)))
