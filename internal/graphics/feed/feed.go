@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"image"
+	"math"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -455,6 +456,7 @@ func (f *Feed) decoded(s *session, picture *picture, unit *AccessUnit, bandHeigh
 		Unit: unit.Info, SincePrevious: unit.totals.since(f.framedTotals), Arrival: unit.Arrival, Decoded: f.clock.wall(decodedAt),
 		Media: float64(picture.time) / 1e4,
 	}
+	made.info.Captured = s.capture.captured(made.info.Media, unit.Arrival)
 	if bandHeight > 0 {
 		made.info.Bands, made.info.BandHeight = unit.Bands, bandHeight
 	}
@@ -876,7 +878,9 @@ func (s *frameSource) Gray(ctx context.Context, rect image.Rectangle, outWidth, 
 // session is one opening of the stream: its batches, and the goroutine that depacketizes and
 // decodes them (SWScreenFeed.m's serial queue).
 type session struct {
-	feed      *Feed
+	feed *Feed
+	// capture estimates the capture times of the session's pictures, on the decoding goroutine.
+	capture   captureClock
 	batches   chan delivery
 	done      chan struct{}
 	stopOnce  sync.Once
@@ -1072,4 +1076,15 @@ func (s *session) run(opened screen) {
 			}
 		}
 	}
+}
+
+// Captured is when the device captured the frame the lease answered last, on the precise
+// clock in milliseconds since the epoch (FrameInfo.Captured), or NaN before it answered one.
+func (l *Lease) Captured() float64 {
+	l.access.Lock()
+	defer l.access.Unlock()
+	if !l.hasAnswered {
+		return math.NaN()
+	}
+	return l.answered.Captured
 }

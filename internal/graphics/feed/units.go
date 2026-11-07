@@ -87,6 +87,11 @@ type FrameInfo struct {
 	// since the stream's first unit: arrival less media is least for the frames the network
 	// held back least.
 	Media float64
+	// Captured is when the device captured the picture, on the precise clock in milliseconds
+	// since the epoch: its media time plus the least arrival less media of the stream so far
+	// (captureClock), late by the least delay of the stream. A frame that arrives late after
+	// the network held it back still tells when it showed the screen.
+	Captured float64
 	// Bands is how many horizontal bands of BandHeight rows the frame was composed of in a
 	// tiled stream (device.Options.ScreenTiles), 0 for a stream of whole frames; band b
 	// covers the rows from b·BandHeight.
