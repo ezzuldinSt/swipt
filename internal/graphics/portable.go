@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	goimage "image"
 	"math"
 	"strconv"
 	"strings"
@@ -49,6 +50,15 @@ type prepared struct {
 	method    string
 	arguments json.RawMessage
 	objects   []any
+}
+
+// release gives up the holds the call took on its images.
+func (p *prepared) release() {
+	for _, object := range p.objects {
+		if image, isImage := object.(*raster.Image); isImage {
+			image.Release()
+		}
+	}
 }
 
 // The time between screenshots while a script watches the screen.
@@ -237,6 +247,7 @@ func (g *Graphics) Run(id uint64, callID int64, call *automation.GraphicsCall) (
 	done := make(chan outcome, 1)
 	go func() {
 		value, err := g.execute(ctx, e, it, call)
+		it.release()
 		done <- outcome{value, err}
 	}()
 	var result outcome
@@ -274,11 +285,11 @@ func (g *Graphics) execute(ctx context.Context, e *engine, it *prepared, call *a
 		if err != nil {
 			return nil, err
 		}
-		source, err := recognizable(ctx, image)
-		if err != nil {
-			return nil, err
-		}
-		text, err := env.readText(ctx, source, options)
+		var text *recognize.Text
+		err = recognizing(ctx, image, func(source recognize.Image) (err error) {
+			text, err = env.readText(ctx, source, options)
+			return err
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -288,11 +299,12 @@ func (g *Graphics) execute(ctx context.Context, e *engine, it *prepared, call *a
 		if !isImage {
 			return nil, &raster.Error{Name: raster.NameType, Message: "graphics: argument 1 of barcodes is not an Image"}
 		}
-		source, err := recognizable(ctx, image)
-		if err != nil {
-			return nil, err
-		}
-		return recognize.ReadBarcodes(ctx, source)
+		var found any
+		err := recognizing(ctx, image, func(source recognize.Image) (err error) {
+			found, err = recognize.ReadBarcodes(ctx, source)
+			return err
+		})
+		return found, err
 	}
 	if call, isVideo := videoCalls[it.method]; isVideo {
 		arguments, err := raster.ParseArguments(it.arguments)
@@ -313,6 +325,7 @@ func (g *Graphics) Watch(id uint64, callID int64, call *automation.GraphicsCall,
 	if it == nil {
 		return failureOf(errEnded)
 	}
+	defer it.release()
 	if it.method != "screen.watch" {
 		return failureOf(&raster.Error{Name: raster.NameType, Message: "graphics: there is no stream " + it.method})
 	}
@@ -387,6 +400,10 @@ func (e *engine) prepare(arguments []jsc.Value) (any, error) {
 		if bytes, isBytes := item.Bytes(); isBytes {
 			objects = append(objects, bytes)
 		} else if payload, isHost := item.HostObject(); isHost {
+			// The call holds its images, which the script may let go before the call ends.
+			if image, isImage := payload.(*raster.Image); isImage {
+				image.Hold()
+			}
 			objects = append(objects, payload)
 		} else {
 			item.Release()
@@ -408,9 +425,11 @@ func (e *engine) take(js *jsc.Context, arguments []jsc.Value) (any, error) {
 	object := e.object(int64(arguments[0].Number()))
 	switch it := object.(type) {
 	case *raster.Image:
-		// As SWNative.m reports a node's cost when it hands an image to JavaScript.
+		// As SWNative.m reports a node's cost when it hands an image to JavaScript. The handle
+		// releases the image once the script lets it go, so a frame's picture goes back to the
+		// feed's pool at once.
 		js.ReportExternalCost(int64(it.EstimatedBytes()))
-		return js.NewHostObject(object, nil), nil
+		return js.NewHostObject(it.Own(), it.Release), nil
 	case *recognize.Text, *videoModel:
 		return js.NewHostObject(object, nil), nil
 	case *recordingSession:
@@ -458,7 +477,7 @@ func (e *engine) op(js *jsc.Context, arguments []jsc.Value) (any, error) {
 	}
 	handle := func(image *raster.Image) any {
 		js.ReportExternalCost(int64(image.EstimatedBytes()))
-		return js.NewHostObject(image, nil)
+		return js.NewHostObject(image.Own(), image.Release)
 	}
 	switch it := payload.(type) {
 	case *raster.Image:
@@ -557,6 +576,9 @@ func (e *engine) keep(object any) int64 {
 	if session, isRecording := object.(*recordingSession); isRecording && !accepted {
 		session.abandon()
 	}
+	if image, isImage := object.(*raster.Image); isImage && !accepted {
+		image.Release()
+	}
 	return identifier
 }
 
@@ -595,14 +617,22 @@ func (e *engine) object(id int64) any {
 	return object
 }
 
+// drop lets go of a result the script did not take.
 func (e *engine) drop(id int64) {
-	e.object(id)
+	if image, isImage := e.object(id).(*raster.Image); isImage {
+		image.Release()
+	}
 }
 
 func (e *engine) close() {
 	e.access.Lock()
 	e.closed = true
 	clear(e.prepared)
+	for _, object := range e.objects {
+		if image, isImage := object.(*raster.Image); isImage {
+			defer image.Release()
+		}
+	}
 	clear(e.objects)
 	recordings := e.recordings
 	e.recordings = make(map[*recordingSession]struct{})
@@ -663,11 +693,11 @@ func (v environment) RecognizeText(ctx context.Context, frame *raster.Image, arg
 	if err := json.Unmarshal(arguments, &options); err != nil {
 		return nil, E.Cause(err, "graphics: decode the text options")
 	}
-	source, err := recognizable(ctx, frame)
-	if err != nil {
-		return nil, err
-	}
-	text, err := v.readText(ctx, source, options)
+	var text *recognize.Text
+	err := recognizing(ctx, frame, func(source recognize.Image) (err error) {
+		text, err = v.readText(ctx, source, options)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -744,12 +774,13 @@ func textCall(it *prepared) (*raster.Image, recognize.TextOptions, error) {
 	return image, options, nil
 }
 
-func recognizable(ctx context.Context, image *raster.Image) (recognize.Image, error) {
-	pixels, err := image.Pixels(ctx)
-	if err != nil {
-		return recognize.Image{}, err
-	}
-	return recognize.Image{Pixels: pixels, Scale: image.Scale(), Frame: image.Frame()}, nil
+// recognizing lends read the image's pixels for a recognizer, which keeps nothing of them: a
+// frame of the live feed makes them into a buffer it takes back afterwards rather than keep
+// 15 MB of RGBA with the script's image.
+func recognizing(ctx context.Context, image *raster.Image, read func(recognize.Image) error) error {
+	return image.UsePixels(ctx, func(pixels goimage.Image) error {
+		return read(recognize.Image{Pixels: pixels, Scale: image.Scale(), Frame: image.Frame()})
+	})
 }
 
 func failure(name string, message ...any) map[string]any {

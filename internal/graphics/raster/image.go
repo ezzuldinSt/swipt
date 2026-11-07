@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/swipt-automation/swipt/internal/graphics/featureprint"
 )
@@ -35,6 +36,10 @@ type Image struct {
 	window     Source
 	windowRect image.Rectangle
 	released   bool
+	// holds counts the holds on the image beyond its first, which Release gives up; owned is
+	// set once a handle holds it (Own).
+	holds atomic.Int32
+	owned atomic.Bool
 
 	// printed is the feature print of distance and nearest, made once (feature.go).
 	printAccess sync.Mutex
@@ -65,7 +70,8 @@ func FromImage(source image.Image, scale, timestamp float64) *Image {
 
 func (m *Image) derive(operation func(*raster) *raster, width, height int, t transform, gray bool) *Image {
 	node := newImage(width, height, t, gray, m.time, m.timestamp)
-	node.parent = m
+	// The derived image holds its parent until it has made its own pixels.
+	node.parent = m.Hold()
 	node.operation = operation
 	return node
 }
@@ -120,13 +126,23 @@ func (m *Image) Timestamp() float64 {
 	return m.timestamp
 }
 
-// EstimatedBytes is the memory the pixels take, which the binding reports to the garbage
-// collector.
+// EstimatedBytes is the memory the image keeps, which the binding reports to the garbage
+// collector: the whole source it shows a part of, such as a frame's picture, and the pixels it
+// made, or the pixels it will make.
 func (m *Image) EstimatedBytes() int {
+	pixels := m.pixelWidth * m.pixelHeight * 4
 	if m.gray {
-		return m.pixelWidth * m.pixelHeight
+		pixels = m.pixelWidth * m.pixelHeight
 	}
-	return m.pixelWidth * m.pixelHeight * 4
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.window == nil {
+		return pixels
+	}
+	if m.cached == nil {
+		pixels = 0
+	}
+	return pixels + m.window.Bytes()
 }
 
 // ToSpace maps a point in pixels to the image's space; ToPixels maps back.
@@ -307,6 +323,9 @@ func (m *Image) raster(ctx context.Context) (*raster, error) {
 	if err != nil {
 		return nil, err
 	}
+	if parent := m.parent; parent != nil {
+		defer parent.Release()
+	}
 	m.cached, m.source, m.parent, m.operation = r, nil, nil, nil
 	return r, nil
 }
@@ -331,9 +350,9 @@ func (m *Image) renderLocked(ctx context.Context) (*raster, error) {
 		if err != nil {
 			return nil, err
 		}
-		// The pixels are all made, so the source can go back.
-		m.window.Release()
-		m.cached, m.window = r, nil
+		// The image keeps its source, and its pixels only while few were made after them.
+		m.cached = r
+		defer remember(m)
 		return r, nil
 	}
 	if m.source != nil {

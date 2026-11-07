@@ -765,6 +765,14 @@ type frameSource struct {
 	released atomic.Bool
 }
 
+// Bytes is the picture's, which the source keeps whatever part of it an image shows.
+func (s *frameSource) Bytes() int {
+	if p := s.frame.picture; p != nil && p.buffer != nil {
+		return cap(*p.buffer)
+	}
+	return 0
+}
+
 func (s *frameSource) Share() raster.Source {
 	s.frame.refs.Add(1)
 	return &frameSource{frame: s.frame}
