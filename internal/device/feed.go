@@ -98,6 +98,13 @@ func (f *ScreenFeed) PixelFormat() uint32 {
 	return f.feeds.pixelFormat()
 }
 
+// Tiles answers how many horizontal bands the device encodes each frame of the running stream
+// in, and the SSRC of the top one: band n comes as its own RTP stream with SSRC base+n, its
+// own parameter sets and sequence numbers. It answers 1 band while no stream runs.
+func (f *ScreenFeed) Tiles() (count int, base uint32) {
+	return f.feeds.tiles()
+}
+
 func (f *ScreenFeed) Close() {
 	f.feeds.remove(f)
 	f.release()
@@ -155,6 +162,21 @@ func (f *screenFeeds) pixelFormat() uint32 {
 		return f.own.stream.stream.Info().PixelFormat
 	}
 	return 0
+}
+
+func (f *screenFeeds) tiles() (int, uint32) {
+	f.access.Lock()
+	defer f.access.Unlock()
+	var info display.StreamInfo
+	switch {
+	case f.viewer != nil:
+		info = f.viewer.stream.stream.Info()
+	case f.own != nil && f.own.stream != nil:
+		info = f.own.stream.stream.Info()
+	default:
+		return 1, 0
+	}
+	return max(info.TilesPerFrame, 1), info.DeviceSSRC
 }
 
 func (f *screenFeeds) viewerStarted(v *videoSource) {
@@ -331,7 +353,7 @@ func (s *Connection) startFeedStream(ctx context.Context) (*deviceStream, error)
 	m.access.Lock()
 	m.lastStart = time.Now()
 	m.access.Unlock()
-	video, err := a.display.StartVideo(ctx, display.StreamOptions{SessionID: uuid.New(), Mode: display.ModeRemoteDesktop})
+	video, err := a.display.StartVideo(ctx, display.StreamOptions{SessionID: uuid.New(), Mode: display.ModeRemoteDesktop, TilesPerFrame: s.screenTiles()})
 	if err != nil {
 		m.access.Lock()
 		m.failures++
@@ -346,4 +368,14 @@ func (s *Connection) startFeedStream(ctx context.Context) (*deviceStream, error)
 	m.access.Unlock()
 	_ = video.RequestKeyFrame()
 	return stream, nil
+}
+
+// screenTiles is how many bands the screen feed's own stream asks for: 2 or 4 when
+// Options.ScreenTiles says so, else 1.
+func (s *Connection) screenTiles() int {
+	switch s.options.ScreenTiles {
+	case 2, 4:
+		return s.options.ScreenTiles
+	}
+	return 1
 }
